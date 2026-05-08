@@ -1,0 +1,29 @@
+# baseline/config/scenario_filter/boston.yaml
+# Boston 数据上的快速调试场景过滤配置（小规模）。
+
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+_convert_: "all"
+
+scenario_types: null
+
+# 指定具体的 Log 名称，这样 NuPlan 就只会加载这一个文件，启动极快
+# log_names:
+#   - "2021.08.18.18.32.06_veh-28_00049_00111"
+#   - "2021.08.18.18.32.06_veh-28_00173_00332"
+
+log_names: null
+
+scenario_tokens: null
+map_names: null
+
+num_scenarios_per_type: null
+limit_total_scenarios: 4 # 限制只跑 2 个场景用于 Debug
+timestamp_threshold_s: null
+ego_displacement_minimum_m: null
+ego_start_speed_threshold: null
+ego_stop_speed_threshold: null
+speed_noise_tolerance: null
+
+expand_scenarios: false
+remove_invalid_goals: false
+shuffle: false

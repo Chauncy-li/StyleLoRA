@@ -1,0 +1,75 @@
+# baseline/config/train.yaml
+#
+# 基线训练主配置：
+# 1) 统一组织数据路径、训练超参数、日志输出；
+# 2) 通过 defaults 引入具体 method 配置；
+# 3) 供 `train.py` 训练入口直接加载。
+
+defaults:
+  - method: diffusion_planner     # 默认加载 config/method/diffusion_planner.yaml
+  - _self_                    # 允许本文件参数覆盖 method 中的参数（如果有冲突）
+
+# --- 基础设置 ---
+name: "${method.name}"  # 引用 method 配置中的名字
+save_dir: "/mnt/mydata/lishangwen/NuplanBaselinesRecord/nuplan_baseline" # 模型和日志的保存路径
+notes: ""
+seed: 3407
+debug: false
+use_wandb: true
+
+# --- 数据集设置 (通常这部分是通用的，除非不同模型需要完全不同的数据格式) ---
+data:
+  # 本地数据路径
+  train_set: "/mnt/mydata/lishangwen/NuplanBaselinesRecord/CACHE/cog_cache1"  # npz 训练数据
+  train_set_list: "/mnt/mydata/lishangwen/NuplanBaselinesRecord/CACHE/train_cog_cache_list1.json" # 训练集列表
+  normalization_file_path: "/home/lsw/meta_programs/Nuplan-Diffusion-Baseline/baseline/resources/normalization_train.json" # 数据归一化文件
+
+  augment_prob: 0.5
+  use_data_augment: true
+  num_workers: 4
+  pin_mem: true
+
+  # 如果这些维度定义是数据本身固有的，放在这里；
+  # 如果是模型输入层强绑定的，也可以挪到 method 里。建议放在这里：
+  future_len: 80
+  time_len: 21
+  agent_state_dim: 11
+  agent_num: 32
+  static_objects_state_dim: 10
+  static_objects_num: 5
+  lane_len: 20
+  lane_state_dim: 12
+  lane_num: 70
+  route_len: 20
+  route_state_dim: 12
+  route_num: 25
+
+# --- 训练超参数 ---
+training:
+  train_epochs: 100  # 训练轮数
+  save_utd: 20
+  batch_size: 200    # 200
+  learning_rate: 5e-4
+  warm_up_epoch: 5
+  alpha_planning_loss: 1.0
+  meta_action_loss: 1.0
+  device: "cuda"
+
+  # 训练集控制
+  train_start_index: 0          # 从第几个数据开始 (默认0)
+  train_num_samples: 60000      # 使用多少条数据 (null 或不写代表使用全部)
+
+  # 验证集控制
+  val_start_index: 60000            # 从第几个数据开始 (默认0)
+  val_num_samples: 14000         # 使用多少条数据
+
+# --- 分布式设置 ---
+distributed:
+  ddp: false
+  port: "22323"
+
+# --- Hydra 输出路径管理 ---
+hydra:
+  run:
+    dir: ${save_dir}/hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/${name}
+  output_subdir: config_save

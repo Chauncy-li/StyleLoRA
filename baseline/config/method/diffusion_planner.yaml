@@ -1,0 +1,27 @@
+# baseline/config/method/diffusion_planner.yaml
+#
+# Diffusion Planner 的“方法级”配置，正常不修改：
+# - 只描述模型结构与方法相关参数；
+# - 数据路径、训练资源等通用设置放在 train.yaml。
+
+name: "diffusion-planner"
+
+model:
+  # Transformer 结构参数
+  encoder_depth: 3
+  decoder_depth: 3
+  num_heads: 6
+  hidden_dim: 192
+  encoder_drop_path_rate: 0.1
+  decoder_drop_path_rate: 0.1
+
+  # Diffusion 相关
+  guidance_fn: null
+  diffusion_model_type: "x_start" # choices: ['score', 'x_start']
+
+  # Decoder 输出相关
+  predicted_neighbor_num: 10
+
+  # 其他模型特定配置
+  use_ema: true
+  resume_model_path: null

@@ -1,0 +1,23 @@
+# baseline/config/scenario_filter/mini.yaml
+# NuPlan mini 数据集的小规模调试过滤配置。
+
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+_convert_: "all"
+
+scenario_types: null
+
+scenario_tokens: null
+log_names: null
+map_names: null
+
+num_scenarios_per_type: null
+limit_total_scenarios: 4
+timestamp_threshold_s: null
+ego_displacement_minimum_m: null # Whether to remove scenarios where the ego moves less than a certain amount
+ego_start_speed_threshold: null # Limit to scenarios where the ego reaches a certain speed from below
+ego_stop_speed_threshold: null # Limit to scenarios where the ego reaches a certain speed from above
+speed_noise_tolerance: null # Value at or below which a speed change between two timepoints should be ignored as noise.
+
+expand_scenarios: false
+remove_invalid_goals: false
+shuffle: false
