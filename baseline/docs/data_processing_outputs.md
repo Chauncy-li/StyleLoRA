@@ -62,7 +62,7 @@
 - `R = route_num`（默认 25）
 - `P = lane_len`（默认 20；route 也按该点数对齐）
 
-### 2.4 Codebook 额外标签（你提到的“额外输出”）
+### 2.4 Codebook 额外标签（用不到）
 
 | 字段名 | 说明 | 类型 |
 |---|---|---|
@@ -86,9 +86,6 @@
 - `static_objects`
 
 2. `code_lat` / `code_lon` / `code_rho` 不参与当前 `train.py` 的损失计算  
-它们主要用于：
-- 标签质量检查脚本：`baseline/verify_codebook_labels.py`
-- 数据集兼容保留（`common/dataset.py` 会读 `code_lat`、`code_lon`）
 
 ## 4. 快速自检一个 `.npz` 是否完整
 
