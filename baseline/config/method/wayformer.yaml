@@ -1,0 +1,32 @@
+# baseline/config/method/wayformer.yaml
+#
+# Wayformer 的“方法级”配置：
+# - 描述模型结构与 loss 相关参数；
+# - 数据路径与训练资源参数放在 train.yaml。
+
+name: "wayformer"
+
+model:
+  # 编码器参数
+  hidden_dim: 256
+  num_heads: 4
+  encoder_depth: 2
+  encoder_drop_path_rate: 0.1
+  num_queries_enc: 192
+
+  # Wayformer 解码器参数
+  decoder_depth: 8
+  decoder_drop_path_rate: 0.1
+  num_queries_dec: 64
+  num_modes: 6
+  cross_attention_widening_factor: 4
+
+  # GMM loss 参数
+  use_square_gmm: false
+  rho_limit: 0.5
+  log_std_range: [-1.609, 5.0]
+
+  # 训练控制
+  use_ema: true
+  resume_model_path: null
+  predicted_neighbor_num: 32

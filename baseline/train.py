@@ -1,120 +1,98 @@
 # -*- coding: utf-8 -*-
 """
-Diffusion Planner 训练主脚本（Hydra 入口）。
+Baseline 训练主脚本（注册制）。
 
 功能说明：
-1. 读取 Hydra 配置并构建训练/验证数据；
-2. 执行 diffusion 训练循环（含可选 EMA）；
-3. 记录日志并保存最佳/周期模型。
+1. 通过 Hydra 加载训练配置；
+2. 通过注册表按 `method.name` 动态选择模型与 train/val 循环；
+3. 保持 Diffusion 原训练逻辑不变，同时支持 Wayformer 训练接入。
 
-维护约定：
-- 本文件保留原训练逻辑，不改损失定义和训练流程。
-- baseline 版本仅保留 diffusion 训练主线。
+当前支持：
+- diffusion-planner
+- wayformer
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import sys
-import logging
-import torch
-import hydra
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple, Any, Optional, Union, List
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from torch import optim, nn
-from torch.utils.data import Subset, DataLoader
-from timm.utils import ModelEma
+import hydra
+import torch
 from mmengine.fileio import dump
 from omegaconf import DictConfig
+from timm.utils import ModelEma
+from torch import nn, optim
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 # 环境设置与路径修补
 # -----------------------------------------------------------------------------
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["HYDRA_FULL_ERROR"] = "1"
+os.environ["HYDRA_FULL_ERROR"] = "0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 
-# NuPlan Devkit 路径
-sys.path.append("/home/lisw/programs/Nuplan-Baseline-3090/nuplan-devkit")
-sys.path.append(str(REPO_ROOT))
+
+def _append_if_exists(path: Path) -> None:
+    if path.exists() and str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+
+# 优先使用当前工程内的 nuplan-devkit，保留历史路径兜底
+_append_if_exists(REPO_ROOT / "nuplan-devkit")
+_append_if_exists(REPO_ROOT)
 
 HYDRA_CONFIG_PATH = str((SCRIPT_DIR / "config").resolve())
-if not os.path.isdir(HYDRA_CONFIG_PATH):
-    HYDRA_CONFIG_PATH = "/home/lisw/programs/Nuplan-Baseline-3090/nuplan_baseline/config"
 
 # -----------------------------------------------------------------------------
 # 本地模块导入
 # -----------------------------------------------------------------------------
-from baseline.train.train_utils import set_seed, resume_model
-from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
-from baseline.utils.lr_schedule import CosineAnnealingWarmUpRestarts
-from baseline.utils.logger import WandbLogger as Logger
 from baseline.common.data_augmentation import StatePerturbation
 from baseline.common.dataset import ClosedLoopPlannerData
-from baseline.train.manage import flatten_config, save_model, manage_best_models
-
-# 模型与 Loss
+from baseline.core.register import Registry
 from baseline.model.diff_planner import diffusion_planner
 from baseline.model.diff_planner.loss.diff_loss import diffusion_loss_func
+from baseline.model.wayformer.wayf_planner import WayFormer
+from baseline.train.manage import flatten_config, manage_best_models, save_model
+from baseline.train.train_utils import resume_model, set_seed
+from baseline.utils.logger import WandbLogger as Logger
+from baseline.utils.lr_schedule import CosineAnnealingWarmUpRestarts
+from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
 
-# 日志配置
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-SKIP_VALIDATION = True  # 如果为 True，则跳过验证环节，并使用训练 Loss 保存最佳模型
+SKIP_VALIDATION = True  # True 时跳过 val，按 train loss 保存 best
 
 
-# -----------------------------------------------------------------------------
-# 1. Model Factory (模型构建工厂)
-# -----------------------------------------------------------------------------
-def build_model(args: Any) -> nn.Module:
-    """
-    根据配置名称构建对应的 Planner 模型实例。
-    """
-    if args.name == "diffusion-planner":
-        return diffusion_planner.Diffusion_Planner(args)
-    raise ValueError(
-        f"Unknown model name: {args.name}. "
-        "Current baseline only keeps diffusion-planner."
-    )
+@dataclass(frozen=True)
+class TrainMethodSpec:
+    """不同方法对应的训练入口描述。"""
+
+    model_builder: Any
+    train_epoch_fn: Any
+    validate_epoch_fn: Any
 
 
-# -----------------------------------------------------------------------------
-# 2. Diffusion Data Preprocessing (数据预处理)
-# -----------------------------------------------------------------------------
-def _prepare_diffusion_batch(
-        batch: Union[List, Tuple, Dict],
-        args: Any,
-        aug: Optional[StatePerturbation] = None
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    准备 Diffusion Planner 所需的输入数据。
+TRAIN_METHOD_REGISTRY: Registry[TrainMethodSpec] = Registry("train_method")
 
-    功能：
-    1. 统一 List/Tuple 或 Dict 格式的 Batch 数据。
-    2. 执行数据增强 (坐标系扰动)。
-    3. 特征工程：将航向角 (heading) 转换为 (cos, sin)。
-    4. 执行观测数据归一化 (Observation Normalization)。
 
-    Args:
-        batch: DataLoader 输出的原始 batch 数据。
-        args: 全局配置参数。
-        aug: 数据增强模块实例。
+def _batch_to_common_inputs(
+    batch: Union[List, Tuple, Dict[str, torch.Tensor]],
+    device: str,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """将 DataLoader batch 统一解包为基础输入 + GT。"""
 
-    Returns:
-        inputs: 归一化后的模型输入字典。
-        ego_future: 自车未来轨迹 GT [B, T, 4] (x, y, cos, sin)。
-        neighbors_future: 他车未来轨迹 GT [B, N, T, 4] (x, y, cos, sin)。
-        mask: 他车有效性 Mask [B, N]。
-    """
-    device = args.device if isinstance(args.device, str) else str(args.device)
-
-    # --- A. 数据解包与设备移动 ---
     if isinstance(batch, (list, tuple)):
-        # 兼容 ClosedLoopPlannerData 的 Tuple 返回格式
         inputs = {
             "ego_current_state": batch[0].to(device),
             "neighbor_agents_past": batch[2].to(device),
@@ -126,15 +104,14 @@ def _prepare_diffusion_batch(
             "route_lanes_has_speed_limit": batch[9].to(device),
             "static_objects": batch[10].to(device),
         }
-        ego_future = batch[1].to(device)  # Raw Meters
-        neighbors_future = batch[3].to(device)  # Raw Meters
-
+        ego_future = batch[1].to(device)
+        neighbors_future = batch[3].to(device)
     elif isinstance(batch, dict):
-        # 兼容 Dict 格式的 Dataset
         def _get(*keys):
-            for k in keys:
-                if k in batch: return batch[k]
-            raise KeyError(f"Missing keys {keys} in batch. Keys: {list(batch.keys())[:5]}...")
+            for key in keys:
+                if key in batch:
+                    return batch[key]
+            raise KeyError(f"Missing keys {keys}. Batch keys: {list(batch.keys())[:8]} ...")
 
         inputs = {
             "ego_current_state": _get("ego_current_state", "ego_current").to(device),
@@ -152,15 +129,26 @@ def _prepare_diffusion_batch(
     else:
         raise TypeError(f"Unsupported batch type: {type(batch)}")
 
-    # --- B. 数据增强 (Augmentation) ---
-    # 如果启用，会对所有空间坐标（History, Map, GT）进行随机旋转和平移，增强模型鲁棒性
+    return inputs, ego_future, neighbors_future
+
+
+# -----------------------------------------------------------------------------
+# Diffusion 数据预处理
+# -----------------------------------------------------------------------------
+def _prepare_diffusion_batch(
+    batch: Union[List, Tuple, Dict[str, torch.Tensor]],
+    args: Any,
+    aug: Optional[StatePerturbation] = None,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    准备 Diffusion Planner 所需输入，保持与历史训练逻辑一致。
+    """
+    device = args.device if isinstance(args.device, str) else str(args.device)
+    inputs, ego_future, neighbors_future = _batch_to_common_inputs(batch, device)
+
     if aug is not None:
         inputs, ego_future, neighbors_future = aug(inputs, ego_future, neighbors_future)
 
-    # --- C. 目标构建 (Target Construction) ---
-    # Diffusion 模型通常预测 (x, y, cos, sin)，避免直接预测角度带来的周期性问题
-
-    # 1. Ego Future: [B, T, 3] (x, y, h) -> [B, T, 4] (x, y, cos, sin)
     ego_future = torch.cat(
         [
             ego_future[..., :2],
@@ -169,10 +157,7 @@ def _prepare_diffusion_batch(
         dim=-1,
     )
 
-    # 2. Neighbors Future: 处理同上，并生成 Mask
-    # Mask逻辑：如果 (x, y, h) 全为0，则视为无效 Agent
     mask = torch.sum(torch.ne(neighbors_future[..., :3], 0), dim=-1) == 0
-
     neighbors_future = torch.cat(
         [
             neighbors_future[..., :2],
@@ -180,108 +165,104 @@ def _prepare_diffusion_batch(
         ],
         dim=-1,
     )
-    # 将无效 Agent 的值强制置零
     neighbors_future[mask] = 0.0
 
-    # --- D. 输入归一化 (Input Normalization) ---
-    # 使用统计得到的均值/方差对输入特征进行标准化
     inputs = args.observation_normalizer(inputs)
-
     return inputs, ego_future, neighbors_future, mask
 
 
+def _prepare_wayformer_batch(
+    batch: Union[List, Tuple, Dict[str, torch.Tensor]],
+    args: Any,
+    aug: Optional[StatePerturbation] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    准备 Wayformer 所需输入。
+
+    关键点：
+    - 先执行增强与归一化；
+    - 再把米制 GT 覆盖回 inputs，供 compute_loss / compute_metrics 正确计算。
+    """
+    device = args.device if isinstance(args.device, str) else str(args.device)
+    inputs, ego_future_gt, neighbors_future_gt = _batch_to_common_inputs(batch, device)
+
+    if isinstance(batch, (list, tuple)):
+        if len(batch) <= 15:
+            raise ValueError(
+                "Wayformer training requires dataset fields [11..15] "
+                "(ego_agent_past / masks). Current batch length is too short."
+            )
+        inputs.update(
+            {
+                "ego_agent_past": batch[11].to(device),
+                "neighbor_agents_past_mask": batch[12].to(device),
+                "neighbor_agents_future_mask": batch[13].to(device),
+                "lanes_mask": batch[14].to(device),
+                "route_lanes_mask": batch[15].to(device),
+            }
+        )
+    elif isinstance(batch, dict):
+        def _try_get(key: str):
+            return batch[key].to(device) if key in batch else None
+
+        for key in [
+            "ego_agent_past",
+            "neighbor_agents_past_mask",
+            "neighbor_agents_future_mask",
+            "lanes_mask",
+            "route_lanes_mask",
+        ]:
+            value = _try_get(key)
+            if value is not None:
+                inputs[key] = value
+
+        if "ego_agent_past" not in inputs:
+            raise ValueError("Wayformer training requires `ego_agent_past` in batch inputs.")
+        if "neighbor_agents_future_mask" not in inputs:
+            # 兜底：如果数据里没有该 mask，则按坐标非零生成一个
+            valid = torch.sum(torch.abs(neighbors_future_gt[..., :2]), dim=-1) > 1e-4
+            inputs["neighbor_agents_future_mask"] = valid.float()
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    if aug is not None:
+        inputs, ego_future_gt, neighbors_future_gt = aug(inputs, ego_future_gt, neighbors_future_gt)
+
+    inputs["ego_future_gt"] = ego_future_gt
+    inputs["neighbors_future_gt"] = neighbors_future_gt
+    if "ego_future_mask" not in inputs:
+        bsz, tlen, _ = ego_future_gt.shape
+        inputs["ego_future_mask"] = torch.ones((bsz, tlen), dtype=torch.float32, device=device)
+
+    inputs = args.observation_normalizer(inputs)
+
+    # 恢复米制 GT（compute_loss / metrics / safety 相关逻辑依赖真实物理单位）
+    inputs["ego_future_gt"] = ego_future_gt
+    inputs["neighbors_future_gt"] = neighbors_future_gt
+    inputs["neighbor_agents_future"] = neighbors_future_gt
+    return inputs
+
+
 # -----------------------------------------------------------------------------
-# 3. Training & Validation Loops (训练与验证循环)
+# 训练与验证循环：Diffusion
 # -----------------------------------------------------------------------------
 def train_epoch_diffusion(
-        data_loader: DataLoader,
-        model: nn.Module,
-        optimizer: optim.Optimizer,
-        args: Any,
-        ema: Optional[ModelEma],
-        aug: Optional[StatePerturbation] = None
+    data_loader: DataLoader,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    args: Any,
+    ema: Optional[ModelEma],
+    aug: Optional[StatePerturbation] = None,
 ) -> Tuple[Dict[str, float], float]:
-    """
-    Diffusion 模型的一个训练 Epoch。
-    """
     model.train()
     epoch_losses = []
-
-    # 使用 tqdm 包装 data_loader 以显示进度条
     pbar = tqdm(data_loader, desc="Training", dynamic_ncols=True)
 
     for batch in pbar:
-        # 1. 数据准备
         inputs, ego_future, neighbors_future, mask = _prepare_diffusion_batch(batch, args, aug)
 
-        # 2. 清零梯度
         optimizer.zero_grad(set_to_none=True)
-
-        # 3. 前向传播与 Loss 计算
-        # diffusion_loss_func 内部包含模型 Forward 过程 (加噪 -> 预测去噪 -> 计算误差)
-        loss_dict = {}
-        loss_dict, _ = diffusion_loss_func(
-            model,
-            inputs,
-            model.sde.marginal_prob,  # SDE 边缘概率函数
-            (ego_future, neighbors_future, mask),
-            args.state_normalizer,  # 状态归一化器 (用于 Loss 计算时的反归一化或 GT 归一化)
-            loss_dict,
-            args.diffusion_model_type,  # 'score' or 'x_start'
-        )
-
-        # 4. Loss 聚合
-        # 总 Loss = 邻居预测 Loss + alpha * 自车规划 Loss
-        loss_dict["loss"] = loss_dict["neighbor_prediction_loss"] + args.alpha_planning_loss * loss_dict[
-            "ego_planning_loss"]
-
-        # 5. 反向传播
-        loss_dict["loss"].backward()
-
-        # 6. 梯度裁剪 (防止梯度爆炸)
-        clip_norm = getattr(args, "grad_clip_norm", 5.0)
-        nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-
-        # 7. 参数更新与 EMA
-        optimizer.step()
-        if ema is not None:
-            ema.update(model)
-
-        # 8. 记录 Batch Loss (Detach from graph to save memory)
-        current_loss = loss_dict["loss"].item()
-
-        epoch_losses.append(
-            {k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v) for k, v in loss_dict.items()})
-
-        pbar.set_postfix({"loss": f"{current_loss:.4f}"})
-
-    mean_stats = {}
-    if len(epoch_losses) > 0:
-        keys = epoch_losses[0].keys()
-        for k in keys:
-            mean_stats[k] = sum(d.get(k, 0.0) for d in epoch_losses) / len(epoch_losses)
-
-    return mean_stats, mean_stats.get("loss", 0.0)
-
-
-@torch.no_grad()
-def validate_epoch_diffusion(
-        val_loader: DataLoader,
-        model: nn.Module,
-        args: Any,
-        aug: Optional[StatePerturbation] = None
-) -> Dict[str, float]:
-    """
-    Diffusion 模型的验证循环。
-    注意：这里主要计算验证集上的 Loss 作为性能指标，而非采样后的 ADE/FDE (采样速度慢)。
-    """
-    model.eval()
-    epoch_losses = []
-
-    for batch in val_loader:
-        inputs, ego_future, neighbors_future, mask = _prepare_diffusion_batch(batch, args, aug=None)
-
-        loss_dict = {}
+        loss_dict: Dict[str, Any] = {}
         loss_dict, _ = diffusion_loss_func(
             model,
             inputs,
@@ -291,31 +272,183 @@ def validate_epoch_diffusion(
             loss_dict,
             args.diffusion_model_type,
         )
-
         loss_dict["loss"] = loss_dict["neighbor_prediction_loss"] + args.alpha_planning_loss * loss_dict[
-            "ego_planning_loss"]
+            "ego_planning_loss"
+        ]
+        loss_dict["loss"].backward()
+
+        clip_norm = getattr(args, "grad_clip_norm", 5.0)
+        nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+        optimizer.step()
+
+        if ema is not None:
+            ema.update(model)
 
         epoch_losses.append(
-            {k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v) for k, v in loss_dict.items()})
+            {key: float(val.detach().cpu()) if torch.is_tensor(val) else float(val) for key, val in loss_dict.items()}
+        )
+        pbar.set_postfix({"loss": f"{loss_dict['loss'].item():.4f}"})
 
-    mean_stats = {}
-    if len(epoch_losses) > 0:
-        keys = epoch_losses[0].keys()
-        for k in keys:
-            mean_stats[k] = sum(d.get(k, 0.0) for d in epoch_losses) / len(epoch_losses)
+    mean_stats: Dict[str, float] = {}
+    if epoch_losses:
+        for key in epoch_losses[0].keys():
+            mean_stats[key] = sum(loss_item.get(key, 0.0) for loss_item in epoch_losses) / len(epoch_losses)
 
+    return mean_stats, mean_stats.get("loss", 0.0)
+
+
+@torch.no_grad()
+def validate_epoch_diffusion(
+    val_loader: DataLoader,
+    model: nn.Module,
+    args: Any,
+    aug: Optional[StatePerturbation] = None,
+) -> Dict[str, float]:
+    model.eval()
+    epoch_losses = []
+
+    for batch in val_loader:
+        inputs, ego_future, neighbors_future, mask = _prepare_diffusion_batch(batch, args, aug=None)
+        loss_dict: Dict[str, Any] = {}
+        loss_dict, _ = diffusion_loss_func(
+            model,
+            inputs,
+            model.sde.marginal_prob,
+            (ego_future, neighbors_future, mask),
+            args.state_normalizer,
+            loss_dict,
+            args.diffusion_model_type,
+        )
+        loss_dict["loss"] = loss_dict["neighbor_prediction_loss"] + args.alpha_planning_loss * loss_dict[
+            "ego_planning_loss"
+        ]
+        epoch_losses.append(
+            {key: float(val.detach().cpu()) if torch.is_tensor(val) else float(val) for key, val in loss_dict.items()}
+        )
+
+    mean_stats: Dict[str, float] = {}
+    if epoch_losses:
+        for key in epoch_losses[0].keys():
+            mean_stats[key] = sum(loss_item.get(key, 0.0) for loss_item in epoch_losses) / len(epoch_losses)
     mean_stats.setdefault("brier_fde", mean_stats.get("loss", float("inf")))
     return mean_stats
 
 
 # -----------------------------------------------------------------------------
-# 4. Main Execution (主入口)
+# 训练与验证循环：Wayformer
 # -----------------------------------------------------------------------------
+def train_epoch_wayformer(
+    data_loader: DataLoader,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    args: Any,
+    ema: Optional[ModelEma],
+    aug: Optional[StatePerturbation] = None,
+) -> Tuple[Dict[str, float], float]:
+    model.train()
+    epoch_logs: List[Dict[str, float]] = []
+    pbar = tqdm(data_loader, desc="Training", dynamic_ncols=True)
+
+    for batch in pbar:
+        inputs = _prepare_wayformer_batch(batch, args, aug)
+        optimizer.zero_grad(set_to_none=True)
+
+        model_output = model(inputs)
+        loss_dict = model.compute_loss(model_output, inputs)
+        total_loss = loss_dict["loss"]
+        total_loss.backward()
+
+        clip_norm = getattr(args, "grad_clip_norm", 5.0)
+        nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+        optimizer.step()
+
+        if ema is not None:
+            ema.update(model)
+
+        log_dict = {key: float(val.detach().cpu()) if torch.is_tensor(val) else float(val) for key, val in loss_dict.items()}
+        if hasattr(model, "compute_metrics"):
+            metric_dict = model.compute_metrics(model_output, inputs)
+            metric_dict = {
+                key: float(val.detach().cpu()) if torch.is_tensor(val) else float(val)
+                for key, val in metric_dict.items()
+            }
+            log_dict.update(metric_dict)
+
+        epoch_logs.append(log_dict)
+        pbar.set_postfix({"loss": f"{float(total_loss.detach().cpu()):.4f}"})
+
+    mean_stats: Dict[str, float] = {}
+    if epoch_logs:
+        for key in epoch_logs[0].keys():
+            mean_stats[key] = sum(item.get(key, 0.0) for item in epoch_logs) / len(epoch_logs)
+
+    return mean_stats, mean_stats.get("loss", 0.0)
+
+
+@torch.no_grad()
+def validate_epoch_wayformer(
+    val_loader: DataLoader,
+    model: nn.Module,
+    args: Any,
+    aug: Optional[StatePerturbation] = None,
+) -> Dict[str, float]:
+    model.eval()
+    epoch_logs: List[Dict[str, float]] = []
+
+    for batch in val_loader:
+        inputs = _prepare_wayformer_batch(batch, args, aug=None)
+        model_output = model(inputs)
+        loss_dict = model.compute_loss(model_output, inputs)
+        metric_dict = model.compute_metrics(model_output, inputs) if hasattr(model, "compute_metrics") else {}
+
+        merged = {}
+        merged.update(
+            {key: float(val.detach().cpu()) if torch.is_tensor(val) else float(val) for key, val in loss_dict.items()}
+        )
+        merged.update(
+            {key: float(val.detach().cpu()) if torch.is_tensor(val) else float(val) for key, val in metric_dict.items()}
+        )
+        epoch_logs.append(merged)
+
+    mean_stats: Dict[str, float] = {}
+    if epoch_logs:
+        for key in epoch_logs[0].keys():
+            mean_stats[key] = sum(item.get(key, 0.0) for item in epoch_logs) / len(epoch_logs)
+    mean_stats.setdefault("brier_fde", mean_stats.get("loss", float("inf")))
+    return mean_stats
+
+
+def _register_train_methods() -> None:
+    """集中注册可训练方法，避免主流程里写分支判断。"""
+    if len(TRAIN_METHOD_REGISTRY) > 0:
+        return
+
+    TRAIN_METHOD_REGISTRY.register(
+        "diffusion-planner",
+        TrainMethodSpec(
+            model_builder=lambda args: diffusion_planner.Diffusion_Planner(args),
+            train_epoch_fn=train_epoch_diffusion,
+            validate_epoch_fn=validate_epoch_diffusion,
+        ),
+    )
+    TRAIN_METHOD_REGISTRY.register(
+        "wayformer",
+        TrainMethodSpec(
+            model_builder=lambda args: WayFormer(args),
+            train_epoch_fn=train_epoch_wayformer,
+            validate_epoch_fn=validate_epoch_wayformer,
+        ),
+    )
+
+
+def _build_method_spec(args: Any) -> TrainMethodSpec:
+    _register_train_methods()
+    return TRAIN_METHOD_REGISTRY.get(args.name)
+
+
 @hydra.main(version_base=None, config_path=HYDRA_CONFIG_PATH, config_name="train")
 def model_training(cfg: DictConfig):
-    """
-    主训练函数，由 Hydra 驱动。
-    """
+    """主训练函数（Hydra 入口）。"""
     cfg.distributed.ddp = False
     args = flatten_config(cfg)
 
@@ -326,9 +459,18 @@ def model_training(cfg: DictConfig):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     args.device = str(device)
 
+    method_spec = _build_method_spec(args)
+    if args.name == "wayformer" and getattr(args, "agent_num", None) != getattr(args, "predicted_neighbor_num", None):
+        raise ValueError(
+            "Wayformer expects `data.agent_num == method.model.predicted_neighbor_num` "
+            "for neighbor prediction supervision. "
+            f"Got agent_num={getattr(args, 'agent_num', None)}, "
+            f"predicted_neighbor_num={getattr(args, 'predicted_neighbor_num', None)}."
+        )
+
     if global_rank == 0:
         if args.resume_model_path is None:
-            current_time = datetime.now().strftime('%Y_%m_%d-%H_%M_%S')
+            current_time = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
             save_path = f"{cfg.save_dir}/train_log/{cfg.name}/{current_time}/"
         else:
             save_path = cfg.model.resume_model_path
@@ -336,20 +478,21 @@ def model_training(cfg: DictConfig):
         os.makedirs(save_path, exist_ok=True)
 
         args_dict = vars(args)
-        args_dict = {k: (v if not isinstance(v, (StateNormalizer, ObservationNormalizer)) else v.to_dict())
-                     for k, v in args_dict.items()}
+        args_dict = {
+            key: (val if not isinstance(val, (StateNormalizer, ObservationNormalizer)) else val.to_dict())
+            for key, val in args_dict.items()
+        }
         dump(args_dict, os.path.join(save_path, "args.json"), file_format="json", indent=4)
     else:
         save_path = None
 
     set_seed(cfg.seed)
 
-    def prepare_dataset(is_train=True):
+    def prepare_dataset(is_train: bool = True):
         dataset_name = cfg.data.train_set if is_train else getattr(cfg.data, "val_set", cfg.data.train_set)
-        dataset_list = cfg.data.train_set_list if is_train else getattr(cfg.data, "val_set_list",
-                                                                        cfg.data.train_set_list)
+        dataset_list = cfg.data.train_set_list if is_train else getattr(cfg.data, "val_set_list", cfg.data.train_set_list)
 
-        ds = ClosedLoopPlannerData(
+        dataset = ClosedLoopPlannerData(
             dataset_name,
             dataset_list,
             cfg.data.agent_num,
@@ -360,21 +503,19 @@ def model_training(cfg: DictConfig):
         prefix = "train" if is_train else "val"
         start = getattr(cfg.training, f"{prefix}_start_index", 0 if is_train else 12)
         num = getattr(cfg.training, f"{prefix}_num_samples", None)
-
         if start > 0 or num is not None:
-            end = min(start + num, len(ds)) if num else len(ds)
-            ds = Subset(ds, list(range(start, end)))
-        return ds
+            end = min(start + num, len(dataset)) if num else len(dataset)
+            dataset = Subset(dataset, list(range(start, end)))
+        return dataset
 
     train_set = prepare_dataset(True)
-
     train_loader = DataLoader(
         train_set,
         batch_size=cfg.training.batch_size,
         shuffle=True,
         num_workers=cfg.data.num_workers,
         drop_last=True,
-        pin_memory=True
+        pin_memory=True,
     )
 
     if not SKIP_VALIDATION:
@@ -385,12 +526,12 @@ def model_training(cfg: DictConfig):
             shuffle=False,
             num_workers=cfg.data.num_workers,
             drop_last=False,
-            pin_memory=True
+            pin_memory=True,
         )
     else:
         val_loader = None
 
-    planner = build_model(args).to(device)
+    planner = method_spec.model_builder(args).to(device)
     model_ema = ModelEma(planner, decay=0.999, device=device) if getattr(args, "use_ema", False) else None
 
     optimizer = optim.AdamW([{"params": planner.parameters(), "lr": args.learning_rate}])
@@ -403,27 +544,22 @@ def model_training(cfg: DictConfig):
         )
 
     wandb_logger = Logger(args.name, args.notes, args, wandb_resume_id=wandb_id, save_path=save_path, rank=global_rank)
+    aug = StatePerturbation(augment_prob=cfg.data.augment_prob, device=args.device) if cfg.data.use_data_augment else None
 
-    aug = StatePerturbation(augment_prob=cfg.data.augment_prob,
-                            device=args.device) if cfg.data.use_data_augment else None
-
-    train_epoch_fn = train_epoch_diffusion
+    train_epoch_fn = method_spec.train_epoch_fn
+    validate_epoch_fn = method_spec.validate_epoch_fn
 
     for epoch in range(init_epoch, cfg.training.train_epochs):
         if global_rank == 0:
-            logger.info(f"Epoch {epoch + 1}/{cfg.training.train_epochs}")
+            logger.info("Epoch %s/%s", epoch + 1, cfg.training.train_epochs)
 
         train_log, train_total_loss = train_epoch_fn(train_loader, planner, optimizer, args, model_ema, aug)
-
-        if not SKIP_VALIDATION:
-            val_metrics = validate_epoch_diffusion(val_loader, planner, args, aug=None)
-        else:
-            val_metrics = {}
+        val_metrics = validate_epoch_fn(val_loader, planner, args, aug=None) if not SKIP_VALIDATION else {}
 
         if global_rank == 0:
-            wandb_logger.log_metrics({f"train/{k}": v for k, v in train_log.items()}, step=epoch + 1)
+            wandb_logger.log_metrics({f"train/{key}": val for key, val in train_log.items()}, step=epoch + 1)
             if not SKIP_VALIDATION:
-                wandb_logger.log_metrics({f"val/{k}": v for k, v in val_metrics.items()}, step=epoch + 1)
+                wandb_logger.log_metrics({f"val/{key}": val for key, val in val_metrics.items()}, step=epoch + 1)
             wandb_logger.log_metrics({"lr": optimizer.param_groups[0]["lr"]}, step=epoch + 1)
 
             if SKIP_VALIDATION:

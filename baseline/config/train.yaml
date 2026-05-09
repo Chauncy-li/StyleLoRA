@@ -6,7 +6,7 @@
 # 3) 供 `train.py` 训练入口直接加载。
 
 defaults:
-  - method: diffusion_planner     # 默认加载 config/method/diffusion_planner.yaml
+  - method: diffusion_planner     # 默认加载 config/method/diffusion_planner.yaml；可选的还有 wayformer
   - _self_                    # 允许本文件参数覆盖 method 中的参数（如果有冲突）
 
 # --- 基础设置 ---

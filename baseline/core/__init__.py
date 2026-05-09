@@ -8,3 +8,7 @@
 当前状态：
 - 该目录仍是轻量骨架，后续可逐步承接 `scripts` 中的流程逻辑。
 """
+
+from baseline.core.register import Registry
+
+__all__ = ["Registry"]

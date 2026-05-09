@@ -1,48 +1,48 @@
-# Nuplan Diffusion Baseline
+# NuPlan Diffusion Baseline
 
 > 文档更新时间：**2026-05-08 (UTC+8)**
 
 ## 1. 项目简介
 
-这是一个面向 NuPlan 的 **Diffusion Planner baseline** 工程包，目标是提供一套可复现、可整理、可共享的研究基线。
+这是一个面向 NuPlan 的研究基线工程，当前支持两种可切换模型：
 
-当前版本聚焦：
+- `diffusion-planner`
+- `wayformer`
 
-- `diffusion-planner` 训练主线
-- `diffusion-planner` 闭环仿真主线
-- 数据处理与标签校验脚本
-- 统一后的 `baseline/` 目录结构
+本仓库已经将训练与仿真入口改为**注册制**，便于后续继续扩展新架构并保持主流程稳定。
 
 ## 2. 目录结构
 
 ```text
 baseline/
   config/                    # 训练与仿真配置
+    method/                  # 训练方法配置 (diffusion_planner / wayformer)
+    planner/                 # 仿真 planner 配置 (diffusion_planner / wayformer)
   common/                    # 通用数据增强/数据集工具
-  core/                      # 预留核心编排模块
+  core/                      # 注册器与核心编排工具
   data_process/              # NuPlan 场景转训练样本
-  model/diff_planner/        # Diffusion Planner 模型
-  simulation/                # 闭环仿真 planner / render / metrics
-  train/                     # 训练工具模块（manage / train_utils / train_val_epoch）
+  model/
+    diff_planner/            # Diffusion Planner 模型
+    wayformer/               # Wayformer 模型
+  simulation/                # 闭环仿真封装、渲染、评估
+  train/                     # 训练工具模块
   utils/                     # 配置、归一化、日志、DDP 工具
   resources/                 # baseline 内置 JSON 资源
 
-  train.py                   # 训练主入口
+  train.py                   # 训练主入口（注册制）
   process_data.py            # 数据处理主入口
-  run_simulation.py          # 闭环仿真入口
+  run_simulation.py          # 闭环仿真主入口（注册制）
   run_nuboard_viewer.py      # nuBoard 可视化入口
-  verify_codebook_labels.py  # 标签质量检查
-  build_data_index_json.py   # 数据索引 JSON 生成
 ```
 
 ## 3. 环境准备
-
-建议使用仓库内环境文件：
 
 ```bash
 conda env create -f environment.yml
 conda activate testlocal39
 ```
+
+确保 `nuplan-devkit` 位于仓库根目录（推荐）或可被 `PYTHONPATH` 访问。
 
 ## 4. 快速开始
 
@@ -55,42 +55,54 @@ python baseline/process_data.py \
   --save_path <npz_output_dir>
 ```
 
-说明：
+### 4.2 训练（注册制）
 
-- `process_data.py` 会优先加载当前工程下的 `nuplan-devkit`
-- 场景列表可以用 `--scenario_log_json` 指定
+默认配置文件：`baseline/config/train.yaml`
 
-### 4.2 训练
+- 训练 Diffusion（默认）：
 
 ```bash
 python baseline/train.py
 ```
 
-默认读取：
+- 训练 Wayformer：
 
-- `baseline/config/train.yaml`
-- `baseline/config/method/diffusion_planner.yaml`
+```bash
+python baseline/train.py method=wayformer
+```
 
-### 4.3 闭环仿真
+说明：
+
+- `train.py` 会按 `method.name` 自动从注册表选择模型与 train/val 循环。
+- 当前已注册：`diffusion-planner`、`wayformer`。
+
+### 4.3 闭环仿真（注册制）
+
+脚本：`baseline/run_simulation.py`
+
+运行前修改：
+
+- `PLANNER`（`diffusion_planner` 或 `wayformer`）
+- `CHECKPOINT_DIR / ARGS_FILE / CKPT_FILE`
+- 数据与地图路径常量
+
+运行：
 
 ```bash
 python baseline/run_simulation.py
 ```
 
-运行前请先检查脚本顶部路径（checkpoint、数据集、地图、输出目录）。
+说明：
 
-### 4.4 结果可视化（nuBoard）
+- 脚本会动态注入 `planner.<name>.*` Hydra 覆盖参数；
+- 默认同时保存：
+  - 视频：`simulation_video/`
+  - step 级原始导出：`raw_step_data/`
+
+### 4.4 nuBoard 可视化
 
 ```bash
 python baseline/run_nuboard_viewer.py
-```
-
-运行前请先检查 `.nuboard` 路径和地图/数据目录路径。
-
-### 4.5 标签分布校验
-
-```bash
-python baseline/verify_codebook_labels.py --data_path <npz_dir>
 ```
 
 ## 5. resources 资源说明
@@ -102,25 +114,10 @@ python baseline/verify_codebook_labels.py --data_path <npz_dir>
 - `nuplan_scenarios_mini.json`
 - `training_mini.json`
 
-这些文件用于 baseline 默认配置和脚本启动兜底，不替代你自己的大规模数据集配置。
+## 6. 注意事项
 
-## 6. 输出目录（典型）
-
-- 训练日志与权重：`<save_dir>/train_log/...`
-- 仿真输出：`<save_dir>/simulation/...`
-- 视频输出：`simulation_video/`
-- step 级原始导出（若启用）：`raw_step_data/`
-
-## 7. 注意事项
-
-- 仓库中部分入口脚本包含本地绝对路径示例，请按你的机器环境修改。
-- 首次运行建议先用小规模数据（mini）做完整链路冒烟测试。
-- 若仅用于 baseline 复现，请保持 `diffusion-planner` 主线配置不变。
-
-## 8. 许可证与引用
-
-如需开源发布，建议补充：
-
-- `LICENSE`
-- 论文/项目引用格式（BibTeX）
-
+- 部分脚本包含本地绝对路径示例，请按机器环境修改。
+- 首次运行建议先用 mini 数据做链路冒烟测试。
+- 若你继续增加新模型，建议仅做两件事：
+  1. 在训练入口注册模型与 train/val 函数；
+  2. 在仿真入口注册 planner 并补对应 `config/planner/*.yaml`。

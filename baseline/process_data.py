@@ -114,13 +114,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--save_path",
-        default="/media/lsw/Work/ubuntu_system/CACHE/minicache",
+        default="/media/lsw/Other/Ubuntu_copy/CACHE/minicache",
         type=str,
         help="Path to save processed .npz data",
     )
 
     parser.add_argument("--scenarios_per_type", type=int, default=None, help="Number of scenarios per type")
-    parser.add_argument("--total_scenarios", type=int, default=443218, help="Limit total number of scenarios")
+    parser.add_argument("--total_scenarios", type=int, default=443218, help="Limit total number of scenarios")  # 一共是 443218
     parser.add_argument("--shuffle_scenarios", type=bool, default=True, help="Whether to shuffle scenarios")
 
     parser.add_argument("--agent_num", type=int, default=32)
