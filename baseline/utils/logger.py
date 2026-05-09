@@ -1,4 +1,4 @@
-﻿import os
+import os
 from typing import Any, Dict
 
 from torch.utils.tensorboard import SummaryWriter
@@ -28,11 +28,12 @@ def _args_to_dict(args: Any) -> Dict[str, Any]:
 
 
 def _normalize_backend(name: str) -> str:
-    value = str(name or "wandb").strip().lower()
+    value = str(name or "swanlab").strip().lower()
     alias = {
         "none": "disabled",
         "off": "disabled",
         "no": "disabled",
+        "close": "disabled",
     }
     return alias.get(value, value)
 
@@ -47,8 +48,15 @@ class WandbLogger:
         self.wandb_writer = None
         self.swanlab_run = None
 
-        self.use_online = bool(getattr(args, "use_wandb", False))
-        self.online_backend = _normalize_backend(getattr(args, "online_logger", "wandb"))
+        # 兼容新旧字段：
+        # - 新字段: use_online_logger / online_logger
+        # - 旧字段: use_wandb（仅作为总开关）
+        self.use_online = bool(
+            getattr(args, "use_online_logger", getattr(args, "use_wandb", True))
+        )
+        self.online_backend = _normalize_backend(
+            getattr(args, "online_logger", getattr(args, "online_logger_backend", "swanlab"))
+        )
 
         if rank != 0:
             return
@@ -136,4 +144,3 @@ class WandbLogger:
                 self.swanlab_run.finish()
             else:
                 swanlab.finish()
-

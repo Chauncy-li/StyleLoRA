@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-09 17:33:38",
+  "prefix": "mini",
+  "source_log_json": "/home/lsw/meta_programs/Nuplan-Diffusion-Baseline/baseline/resources/mini/nuplan_scenarios_mini.json",
+  "db_path": "",
+  "output_dir": "/home/lsw/meta_programs/Nuplan-Diffusion-Baseline/baseline/resources/mini/splits",
+  "group_by": "session",
+  "reuse_existing_test": true,
+  "test_split": {
+    "mode": "reuse_existing_test",
+    "heldout_log_count": 13,
+    "keep_log_count": 51,
+    "ratio_actual": 0.203125,
+    "seed": null,
+    "group_by": "session"
+  },
+  "files": {
+    "test": "/home/lsw/meta_programs/Nuplan-Diffusion-Baseline/baseline/resources/mini/splits/mini_test_logs.json",
+    "cache": "/home/lsw/meta_programs/Nuplan-Diffusion-Baseline/baseline/resources/mini/splits/mini_cache_logs.json",
+    "summary": "/home/lsw/meta_programs/Nuplan-Diffusion-Baseline/baseline/resources/mini/splits/mini_split_summary.json"
+  },
+  "counts": {
+    "source_logs": 64,
+    "test_logs": 13,
+    "cache_logs": 51
+  }
+}

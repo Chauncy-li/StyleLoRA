@@ -120,7 +120,7 @@ def main() -> None:
     )
 
     parser.add_argument("--scenarios_per_type", type=int, default=None, help="Number of scenarios per type")
-    parser.add_argument("--total_scenarios", type=int, default=443218, help="Limit total number of scenarios")  # 一共是 443218
+    parser.add_argument("--total_scenarios", type=int, default=361611, help="Limit total number of scenarios")  # 一共是 443218   # 单纯cache一共是 361611
     parser.add_argument("--shuffle_scenarios", type=bool, default=True, help="Whether to shuffle scenarios")
 
     parser.add_argument("--agent_num", type=int, default=32)
@@ -135,8 +135,8 @@ def main() -> None:
         type=str,
         default=_first_existing(
             [
-                "/media/lsw/Work/ubuntu_system/DATASET/nuplan-v1.1/splits/nuplan_scenarios_mini.json",
-                str(RESOURCES_DIR / "nuplan_scenarios_mini.json"),
+                str(RESOURCES_DIR / "mini" / "splits" / "mini_cache_logs.json"),
+                str(RESOURCES_DIR / "mini" / "nuplan_scenarios_mini.json"),
                 str(REPO_ROOT / "nuplan_scenarios_mini.json"),
             ]
         ),
@@ -145,7 +145,7 @@ def main() -> None:
     parser.add_argument(
         "--npz_list_output_json",
         type=str,
-        default="/media/lsw/Work/ubuntu_system/CACHE/minicache_list.json",
+        default=str(RESOURCES_DIR / "mini" / "training_mini.json"),
         help="Output JSON file storing generated .npz filename list",
     )
 

@@ -1,10 +1,14 @@
 # Baseline 数据处理产物说明
 
-更新时间：2026-05-08 (UTC+8)
+更新时间：2026-05-09 (UTC+8)
 
 ## 1. 数据处理会产出什么
 
 运行入口：`baseline/process_data.py`
+
+mini 默认输入输出：
+- 输入日志列表：`baseline/resources/mini/splits/mini_cache_logs.json`
+- 输出样本列表：`baseline/resources/mini/training_mini.json`
 
 核心产出有 2 类：
 
@@ -106,4 +110,3 @@ PY
 ```bash
 python baseline/verify_codebook_labels.py --data_path <npz_dir>
 ```
-

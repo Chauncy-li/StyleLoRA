@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import glob
+import json
 import os
 import sys
 from pathlib import Path
@@ -39,6 +40,12 @@ SAVE_ROOT = NUPLAN_EXP_ROOT
 PLANNER = "diffusion_planner"
 SUPPORTED_PLANNERS_FALLBACK = ["diffusion_planner", "wayformer"]
 
+# 在线日志后端（默认 swanlab）
+# - swanlab: 优先 swanlab，抑制 wandb 自动初始化
+# - wandb:   使用 wandb
+# - disabled: 关闭在线日志
+ONLINE_LOGGER = "swanlab"
+
 # ==============================================================================
 # 模型 checkpoint 配置，注意要和模型对应上
 # ==============================================================================
@@ -53,6 +60,7 @@ SPLIT = "mini"  # 可选: val14 / test14-random / test14-hard
 CHALLENGE = "closed_loop_nonreactive_agents"
 BRANCH_NAME = "diffusion_debug"
 SCENARIO_BUILDER = "nuplan"
+MINI_TEST_LOG_JSON = REPO_ROOT / "baseline" / "resources" / "mini" / "splits" / "mini_test_logs.json"
 
 
 def _resolve_local_config_path() -> Path:
@@ -69,7 +77,54 @@ def _planner_override(planner_name: str, key: str, value: str) -> str:
     return f"planner.{planner_name}.{key}={value}"
 
 
-def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str]:
+def _normalize_online_logger(name: str) -> str:
+    value = str(name or "swanlab").strip().lower()
+    alias = {
+        "none": "disabled",
+        "off": "disabled",
+        "no": "disabled",
+    }
+    return alias.get(value, value)
+
+
+def _load_log_name_list(path: Path) -> List[str]:
+    """读取 JSON 日志列表；不存在或格式异常时返回空列表。"""
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as file_obj:
+            payload = json.load(file_obj)
+        if not isinstance(payload, list):
+            return []
+        return [str(item) for item in payload]
+    except Exception:
+        return []
+
+
+def _apply_online_logger_env(name: str) -> str:
+    """
+    给仿真进程设置在线日志相关环境变量。
+    说明：run_simulation 本身不直接写 wandb/swanlab，这里用于避免依赖侧自动初始化冲突。
+    """
+    backend = _normalize_online_logger(name)
+    os.environ["ONLINE_LOGGER"] = backend
+
+    if backend == "wandb":
+        os.environ["WANDB_MODE"] = "online"
+        os.environ.pop("WANDB_DISABLED", None)
+    elif backend in {"swanlab", "disabled"}:
+        os.environ["WANDB_MODE"] = "disabled"
+        os.environ["WANDB_DISABLED"] = "true"
+
+    if backend == "disabled":
+        os.environ["SWANLAB_MODE"] = "disabled"
+    else:
+        os.environ.pop("SWANLAB_MODE", None)
+
+    return backend
+
+
+def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str, int]:
     """构建 NuPlan 主脚本所需的 sys.argv，并返回输出目录信息。"""
     filename_wo_ext = Path(CKPT_FILE).stem if os.path.exists(CKPT_FILE) else "unknown_ckpt"
     experiment_uid = f"{PLANNER}/{SPLIT}/{BRANCH_NAME}/{filename_wo_ext}_{timestamp}"
@@ -92,6 +147,18 @@ def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str]:
         _planner_override(PLANNER, "config.render_save_dir", video_output_dir),
         _planner_override(PLANNER, "config.raw_data_save_dir", raw_output_dir),
     ]
+    scenario_filter_overrides: List[str] = []
+    mini_test_count = 0
+    if SPLIT == "mini":
+        mini_test_logs = _load_log_name_list(MINI_TEST_LOG_JSON)
+        if mini_test_logs:
+            # 仅覆盖 log_names；其余参数（如 limit_total_scenarios）继续使用 mini.yaml。
+            scenario_filter_overrides.extend(
+                [
+                    f"scenario_filter.log_names={json.dumps(mini_test_logs, ensure_ascii=False, separators=(',', ':'))}",
+                ]
+            )
+            mini_test_count = len(mini_test_logs)
 
     argv = [
         "run_simulation.py",
@@ -100,6 +167,7 @@ def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str]:
         *planner_overrides,
         f"scenario_builder={SCENARIO_BUILDER}",
         f"scenario_filter={SPLIT}",
+        *scenario_filter_overrides,
         f"scenario_builder.db_files={NUPLAN_DATA_ROOT}",
         f"experiment_uid={experiment_uid}",
         f"output_dir={full_output_dir}",
@@ -110,7 +178,7 @@ def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str]:
         "number_of_gpus_allocated_per_simulation=1.0",
         f"hydra.searchpath={search_path}",
     ]
-    return argv, full_output_dir, video_output_dir, raw_output_dir
+    return argv, full_output_dir, video_output_dir, raw_output_dir, mini_test_count
 
 
 def _load_registered_planners() -> List[str]:
@@ -155,6 +223,7 @@ def main() -> None:
     os.environ["NUPLAN_EXP_ROOT"] = NUPLAN_EXP_ROOT
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["HYDRA_FULL_ERROR"] = "1"
+    active_online_logger = _apply_online_logger_env(ONLINE_LOGGER)
 
     registered_planners = _load_registered_planners()
     if PLANNER not in registered_planners:
@@ -163,7 +232,7 @@ def main() -> None:
         raise SystemExit(1)
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    argv, full_output_dir, video_output_dir, raw_output_dir = _build_sys_argv(timestamp)
+    argv, full_output_dir, video_output_dir, raw_output_dir, mini_test_count = _build_sys_argv(timestamp)
     sys.argv = argv
 
     print(f"🚀 [{PLANNER}] 启动 NuPlan 闭环仿真...")
@@ -171,7 +240,13 @@ def main() -> None:
     print(f"📂 结果输出: {full_output_dir}")
     print(f"🎞️ 视频输出: {video_output_dir}")
     print(f"🧾 原始 step 输出: {raw_output_dir}")
+    print(f"📝 在线日志后端: {active_online_logger}")
     print(f"🔧 模型路径: {CKPT_FILE}")
+    if SPLIT == "mini":
+        if mini_test_count > 0:
+            print(f"🧪 mini 测试日志: {mini_test_count} 条（来自 {MINI_TEST_LOG_JSON}）")
+        else:
+            print(f"⚠️ 未读取到 mini_test_logs，回退为 scenario_filter=mini 默认配置。")
 
     if not os.path.exists(CKPT_FILE):
         print(f"\n❌ [Error] 找不到模型文件: {CKPT_FILE}")

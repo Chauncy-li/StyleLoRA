@@ -15,6 +15,12 @@ save_dir: "/mnt/mydata/lishangwen/NuplanBaselinesRecord/nuplan_baseline" # 模�
 notes: ""
 seed: 3407
 debug: false
+# 在线日志配置（默认 swanlab）
+# - `online_logger`: swanlab / wandb / disabled
+# - `use_online_logger`: 总开关，false 时仅保留本地 tensorboard
+online_logger: "swanlab"
+use_online_logger: true
+# 兼容历史字段（建议保持与 use_online_logger 一致）
 use_wandb: true
 
 # --- 数据集设置 (通常这部分是通用的，除非不同模型需要完全不同的数据格式) ---
