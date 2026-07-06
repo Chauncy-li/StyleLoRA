@@ -1,16 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="lisw-3090-1" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" serverName="100.64.227.98" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="lisw-3090-1">
+      <paths name="100.64.227.98">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/lisw/programs/Nuplan-Baseline-3090" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/lisw/programs/Nuplan-Diffusion-Baseline" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
     </serverData>
-    <option name="myAutoUpload" value="ALWAYS" />
   </component>
 </project>

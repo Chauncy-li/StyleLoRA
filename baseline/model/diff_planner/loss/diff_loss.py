@@ -17,6 +17,44 @@ import torch.nn as nn
 from baseline.utils.normalizer import StateNormalizer
 
 
+def _extract_diffusion_prediction(
+        decoder_output: Dict[str, torch.Tensor],
+        model_type: str,
+        future_steps: int,
+) -> torch.Tensor:
+    candidate_keys = ["x_start", "score"] if model_type == "x_start" else ["score"]
+
+    prediction = None
+    selected_key = None
+    for key in candidate_keys:
+        if key in decoder_output:
+            prediction = decoder_output[key]
+            selected_key = key
+            break
+
+    if prediction is None:
+        raise KeyError(
+            "Diffusion decoder output does not contain a supported prediction key. "
+            f"model_type={model_type}, available_keys={sorted(decoder_output.keys())}"
+        )
+
+    if prediction.ndim != 4:
+        raise ValueError(
+            "Diffusion decoder output must be a 4D tensor [B, P, T, D]. "
+            f"Got key={selected_key}, shape={tuple(prediction.shape)}"
+        )
+
+    if prediction.shape[2] == future_steps + 1:
+        prediction = prediction[:, :, 1:, :]
+    elif prediction.shape[2] != future_steps:
+        raise ValueError(
+            "Diffusion decoder output time dimension does not match supervision. "
+            f"key={selected_key}, pred_shape={tuple(prediction.shape)}, expected_future_steps={future_steps}"
+        )
+
+    return prediction
+
+
 def diffusion_loss_func(
         model: nn.Module,
         inputs: Dict[str, torch.Tensor],
@@ -85,15 +123,19 @@ def diffusion_loss_func(
     }
 
     _, decoder_output = model(merged_inputs)
-    score = decoder_output["score"][:, :, 1:, :]
+    prediction = _extract_diffusion_prediction(
+        decoder_output,
+        model_type=model_type,
+        future_steps=all_gt.shape[2] - 1,
+    )
 
     # ===== 6. 损失计算 =====
     if model_type == "score":
         # 目标：预测归一化噪声
-        dpm_loss = torch.sum((score * std + z) ** 2, dim=-1)
+        dpm_loss = torch.sum((prediction * std + z) ** 2, dim=-1)
     elif model_type == "x_start":
         # 目标：预测去噪后的 future
-        dpm_loss = torch.sum((score - all_gt[:, :, 1:, :]) ** 2, dim=-1)
+        dpm_loss = torch.sum((prediction - all_gt[:, :, 1:, :]) ** 2, dim=-1)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 

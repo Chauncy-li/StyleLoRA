@@ -20,6 +20,18 @@ import os
 import json
 
 
+def _ema_state_dict(ema):
+    """Support either a raw EMA module or timm's ModelEma wrapper."""
+    if ema is None:
+        return None
+    shadow_model = getattr(ema, "ema", None)
+    if shadow_model is not None and hasattr(shadow_model, "state_dict"):
+        return shadow_model.state_dict()
+    if hasattr(ema, "state_dict"):
+        return ema.state_dict()
+    raise TypeError(f"Unsupported EMA object type: {type(ema)!r}")
+
+
 def openjson(path):
     """
     读取JSON文件并返回解析后的字典对象
@@ -107,7 +119,7 @@ def save_model(model, optimizer, scheduler, save_path, epoch, train_loss, wandb_
     """
     save_model = {'epoch': epoch + 1,
                   'model': model.state_dict(),
-                  'ema_state_dict': ema.state_dict(),
+                  'ema_state_dict': _ema_state_dict(ema),
                   'optimizer': optimizer.state_dict(),
                   'schedule': scheduler.state_dict(),
                   'loss': train_loss,

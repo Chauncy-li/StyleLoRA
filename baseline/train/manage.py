@@ -17,6 +17,18 @@ from mmengine import fileio
 from omegaconf import OmegaConf
 
 
+def _ema_state_dict(ema):
+    """Support either a raw EMA module or timm's ModelEma wrapper."""
+    if ema is None:
+        return None
+    shadow_model = getattr(ema, "ema", None)
+    if shadow_model is not None and hasattr(shadow_model, "state_dict"):
+        return shadow_model.state_dict()
+    if hasattr(ema, "state_dict"):
+        return ema.state_dict()
+    raise TypeError(f"Unsupported EMA object type: {type(ema)!r}")
+
+
 def flatten_config(cfg):
     """递归地将 Hydra Config 展平为单层 Namespace，并处理 ListConfig 转换"""
     flat_dict = {}
@@ -39,7 +51,7 @@ def save_model(model, optimizer, scheduler, save_path, epoch, train_loss, wandb_
     save_dict = {
         'epoch': epoch + 1,
         'model': model.state_dict(),
-        'ema_state_dict': ema.state_dict() if ema is not None else None,
+        'ema_state_dict': _ema_state_dict(ema),
         'optimizer': optimizer.state_dict(),
         'schedule': scheduler.state_dict(),
         'loss': train_loss,

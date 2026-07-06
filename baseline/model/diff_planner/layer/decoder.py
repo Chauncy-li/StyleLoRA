@@ -70,6 +70,9 @@ class Decoder(nn.Module):
         self._predicted_neighbor_num = config.predicted_neighbor_num
         self._future_len = config.future_len
         self._sde = VPSDE_linear()
+        self._style_value_dim = int(getattr(config, "style_value_dim", 0))
+        self._cfg_guidance_scale = float(getattr(config, "cfg_guidance_scale", 1.0))
+        self._use_style_condition = bool(getattr(config, "use_style_condition", self._style_value_dim > 0))
 
         self.dit = DiT(
             sde=self._sde, 
@@ -79,7 +82,9 @@ class Decoder(nn.Module):
             hidden_dim=config.hidden_dim, 
             heads=config.num_heads, 
             dropout=dpr,
-            model_type=config.diffusion_model_type
+            model_type=config.diffusion_model_type,
+            style_condition_dim=self._style_value_dim,
+            use_style_condition=self._use_style_condition,
         )
         
         self._state_normalizer: StateNormalizer = config.state_normalizer
@@ -137,19 +142,28 @@ class Decoder(nn.Module):
         ego_neighbor_encoding = encoder_outputs['encoding']
         route_lanes = inputs['route_lanes']
 
-        if self.training:
+        is_diffusion_loss_pass = ("sampled_trajectories" in inputs) and ("diffusion_time" in inputs)
+
+        if is_diffusion_loss_pass:
             sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
             diffusion_time = inputs['diffusion_time']
 
-            return {
-                    "score": self.dit(
-                        sampled_trajectories, 
-                        diffusion_time,
-                        ego_neighbor_encoding,
-                        route_lanes,
-                        neighbor_current_mask
-                    ).reshape(B, P, -1, 4)
+            denoised = self.dit(
+                sampled_trajectories,
+                diffusion_time,
+                style_condition=self._resolve_style_condition(inputs, B),
+                cross_c=ego_neighbor_encoding,
+                route_lanes=route_lanes,
+                neighbor_current_mask=neighbor_current_mask,
+            ).reshape(B, P, -1, 4)
+            if self.dit.model_type == "x_start":
+                return {
+                    "x_start": denoised,
+                    "score": denoised,
                 }
+            return {
+                "score": denoised
+            }
         else:
             # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
             xT = torch.cat([current_states[:, :, None], torch.randn(B, P, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, P, -1)
@@ -159,6 +173,32 @@ class Decoder(nn.Module):
                 xt[:, :, 0, :] = current_states
                 return xt.reshape(B, P, -1)
             
+            style_condition = self._resolve_style_condition(inputs, B)
+            if style_condition is not None:
+                model_wrapper_params = {
+                    "condition": style_condition,
+                    "unconditional_condition": torch.zeros_like(style_condition),
+                    "guidance_scale": float(inputs.get("cfg_guidance_scale", self._cfg_guidance_scale)),
+                    "guidance_type": "classifier-free",
+                }
+            else:
+                model_wrapper_params = {
+                    "classifier_fn": self._guidance_fn,
+                    "classifier_kwargs": {
+                        "model": self.dit,
+                        "model_condition": {
+                            "cross_c": ego_neighbor_encoding, 
+                            "route_lanes": route_lanes,
+                            "neighbor_current_mask": neighbor_current_mask                            
+                        },
+                        "inputs": inputs,
+                        "observation_normalizer": self._observation_normalizer,
+                        "state_normalizer": self._state_normalizer
+                    },
+                    "guidance_scale": 0.5,
+                    "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"
+                }
+
             x0 = dpm_sampler(
                         self.dit,
                         xT,
@@ -170,28 +210,25 @@ class Decoder(nn.Module):
                         dpm_solver_params={
                             "correcting_xt_fn":initial_state_constraint,
                         },
-                        model_wrapper_params={
-                            "classifier_fn": self._guidance_fn,
-                            "classifier_kwargs": {
-                                "model": self.dit,
-                                "model_condition": {
-                                    "cross_c": ego_neighbor_encoding, 
-                                    "route_lanes": route_lanes,
-                                    "neighbor_current_mask": neighbor_current_mask                            
-                                },
-                                "inputs": inputs,
-                                "observation_normalizer": self._observation_normalizer,
-                                "state_normalizer": self._state_normalizer
-                            },
-                            "guidance_scale": 0.5,
-                            "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"
-                        },
+                        model_wrapper_params=model_wrapper_params,
                 )
             x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
 
             return {
                     "prediction": x0
                 }
+
+    def _resolve_style_condition(self, inputs, batch_size: int):
+        if (not self._use_style_condition) or self._style_value_dim <= 0:
+            return None
+        style_condition = inputs.get("style_value_condition")
+        if style_condition is None:
+            return None
+        if style_condition.dim() == 1:
+            style_condition = style_condition.unsqueeze(0)
+        if style_condition.shape[0] == 1 and batch_size > 1:
+            style_condition = style_condition.expand(batch_size, -1)
+        return style_condition
 
         
 class RouteEncoder(nn.Module):
@@ -331,7 +368,20 @@ class DiT(nn.Module):
         _sde (SDE): 随机微分方程对象
         marginal_prob_std: 边缘概率的标准差函数
     """
-    def __init__(self, sde: SDE, route_encoder: nn.Module, depth, output_dim, hidden_dim=192, heads=6, dropout=0.1, mlp_ratio=4.0, model_type="x_start"):
+    def __init__(
+        self,
+        sde: SDE,
+        route_encoder: nn.Module,
+        depth,
+        output_dim,
+        hidden_dim=192,
+        heads=6,
+        dropout=0.1,
+        mlp_ratio=4.0,
+        model_type="x_start",
+        style_condition_dim: int = 0,
+        use_style_condition: bool = False,
+    ):
         """
         初始化 DiT
 
@@ -368,6 +418,17 @@ class DiT(nn.Module):
 
         # 时间步嵌入器：将连续时间 t 编码为高维特征
         self.t_embedder = TimestepEmbedder(hidden_dim)
+        self.use_style_condition = bool(use_style_condition and style_condition_dim > 0)
+        if self.use_style_condition:
+            self.style_condition_proj = nn.Sequential(
+                nn.LayerNorm(style_condition_dim),
+                nn.Linear(style_condition_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.style_condition_proj = None
 
         self.blocks = nn.ModuleList([DiTBlock(hidden_dim, heads, dropout, mlp_ratio) for i in range(depth)])
 
@@ -383,7 +444,7 @@ class DiT(nn.Module):
         """获取模型类型"""
         return self._model_type
 
-    def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
+    def forward(self, x, t, style_condition=None, cross_c=None, route_lanes=None, neighbor_current_mask=None):
         """
         DiT 前向传播
 
@@ -441,6 +502,10 @@ class DiT(nn.Module):
         y = route_encoding
         # 添加时间嵌入：[B, D]
         y = y + self.t_embedder(t)
+        if self.style_condition_proj is not None and style_condition is not None:
+            if style_condition.dim() == 1:
+                style_condition = style_condition.unsqueeze(0)
+            y = y + self.style_condition_proj(style_condition.to(device=y.device, dtype=y.dtype))
 
         # ========== 构建注意力掩码 ==========
         # attn_mask: [B, P] - True 表示需要 mask 的位置
