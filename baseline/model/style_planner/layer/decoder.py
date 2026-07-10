@@ -12,11 +12,11 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 
-from baseline.model.diff_planner.library.sampling import dpm_sampler
-from baseline.model.diff_planner.library.sde import SDE, VPSDE_linear
+from baseline.model.style_planner.library.sampling import dpm_sampler
+from baseline.model.style_planner.library.sde import SDE, VPSDE_linear
 from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
-from baseline.model.diff_planner.layer.mixer import MixerBlock
-from baseline.model.diff_planner.layer.dit import TimestepEmbedder, DiTBlock, FinalLayer
+from baseline.model.style_planner.layer.mixer import MixerBlock
+from baseline.model.style_planner.layer.dit import TimestepEmbedder, DiTBlock, FinalLayer
 
 
 class Decoder(nn.Module):
@@ -82,6 +82,8 @@ class Decoder(nn.Module):
         self._use_phase_style_condition = bool(
             getattr(config, "use_phase_style_condition", self._phase_style_flat_dim > 0)
         )
+        self._use_temporal_style_gate = bool(getattr(config, "use_temporal_style_gate", False))
+        self._temporal_gate_hidden_dim = int(getattr(config, "temporal_gate_hidden_dim", config.hidden_dim))
 
         self.dit = DiT(
             sde=self._sde, 
@@ -99,6 +101,8 @@ class Decoder(nn.Module):
             phase_style_flat_dim=self._phase_style_flat_dim,
             use_style_condition=self._use_style_condition,
             use_phase_style_condition=self._use_phase_style_condition,
+            use_temporal_style_gate=self._use_temporal_style_gate,
+            temporal_gate_hidden_dim=self._temporal_gate_hidden_dim,
         )
         
         self._state_normalizer: StateNormalizer = config.state_normalizer
@@ -171,14 +175,21 @@ class Decoder(nn.Module):
                 neighbor_current_mask=neighbor_current_mask,
                 phase_time_mask=self._resolve_phase_time_mask(inputs, B),
             ).reshape(B, P, -1, 4)
+            temporal_debug = self.dit.pop_last_temporal_gate_outputs()
             if self.dit.model_type == "x_start":
-                return {
+                outputs = {
                     "x_start": denoised,
                     "score": denoised,
                 }
-            return {
+                if temporal_debug is not None:
+                    outputs.update(temporal_debug)
+                return outputs
+            outputs = {
                 "score": denoised
             }
+            if temporal_debug is not None:
+                outputs.update(temporal_debug)
+            return outputs
         else:
             # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
             xT = torch.cat([current_states[:, :, None], torch.randn(B, P, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, P, -1)
@@ -189,6 +200,14 @@ class Decoder(nn.Module):
                 return xt.reshape(B, P, -1)
             
             style_condition = self._resolve_style_condition(inputs, B)
+            temporal_debug = None
+            if style_condition is not None:
+                temporal_debug = self.dit.inspect_temporal_style_condition(
+                    style_condition,
+                    B,
+                    device=current_states.device,
+                    dtype=current_states.dtype,
+                )
             if style_condition is not None:
                 model_wrapper_params = {
                     "condition": style_condition,
@@ -229,11 +248,16 @@ class Decoder(nn.Module):
                         },
                         model_wrapper_params=model_wrapper_params,
                 )
+            if temporal_debug is None:
+                temporal_debug = self.dit.pop_last_temporal_gate_outputs()
             x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
 
-            return {
+            outputs = {
                     "prediction": x0
                 }
+            if temporal_debug is not None:
+                outputs.update(temporal_debug)
+            return outputs
 
     def _resolve_style_condition(self, inputs, batch_size: int):
         if (not self._use_style_condition) or self._style_value_dim <= 0:
@@ -415,6 +439,8 @@ class DiT(nn.Module):
         phase_style_flat_dim: int = 0,
         use_style_condition: bool = False,
         use_phase_style_condition: bool = False,
+        use_temporal_style_gate: bool = False,
+        temporal_gate_hidden_dim: int = 0,
     ):
         """
         初始化 DiT
@@ -466,6 +492,12 @@ class DiT(nn.Module):
             and self._phase_style_condition_dim > 0
             and self._phase_style_flat_dim > 0
         )
+        self.use_temporal_style_gate = bool(
+            use_temporal_style_gate
+            and self.use_phase_style_condition
+            and self._phase_style_num_phases == 2
+        )
+        self._last_temporal_gate_outputs = None
         if self.use_style_condition:
             self.style_condition_proj = nn.Sequential(
                 nn.LayerNorm(self._global_style_condition_dim),
@@ -483,6 +515,21 @@ class DiT(nn.Module):
             )
         else:
             self.phase_style_step_proj = None
+        if self.use_temporal_style_gate:
+            gate_input_dim = self._global_style_condition_dim + self._phase_style_flat_dim
+            gate_hidden_dim = int(temporal_gate_hidden_dim if temporal_gate_hidden_dim > 0 else hidden_dim)
+            self.temporal_gate_stem = nn.Sequential(
+                nn.LayerNorm(gate_input_dim),
+                nn.Linear(gate_input_dim, gate_hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(gate_hidden_dim),
+            )
+            self.temporal_near_gate_head = nn.Linear(gate_hidden_dim, self._phase_style_condition_dim)
+            self.temporal_far_gate_head = nn.Linear(gate_hidden_dim, self._phase_style_condition_dim)
+        else:
+            self.temporal_gate_stem = None
+            self.temporal_near_gate_head = None
+            self.temporal_far_gate_head = None
 
         self.blocks = nn.ModuleList([DiTBlock(hidden_dim, heads, dropout, mlp_ratio) for i in range(depth)])
 
@@ -541,7 +588,14 @@ class DiT(nn.Module):
             这是为了匹配 SDE 的分数函数 ∇_x log p_t(x)。
         """
         B, P, _ = x.shape
+        self._last_temporal_gate_outputs = None
         style_global_condition, phase_style_condition = self._split_style_condition(style_condition, B)
+        phase_style_condition = self._apply_temporal_style_gate(
+            style_global_condition,
+            phase_style_condition,
+            device=x.device,
+            dtype=x.dtype,
+        )
         phase_bias = self._build_phase_trajectory_bias(
             phase_style_condition,
             phase_time_mask,
@@ -629,6 +683,58 @@ class DiT(nn.Module):
                 self._phase_style_condition_dim,
             )
         return global_condition, phase_condition
+
+    def _apply_temporal_style_gate(self, style_global_condition, phase_style_condition, *, device, dtype):
+        if (
+            not self.use_temporal_style_gate
+            or phase_style_condition is None
+            or self.temporal_gate_stem is None
+            or self.temporal_near_gate_head is None
+            or self.temporal_far_gate_head is None
+        ):
+            return phase_style_condition
+
+        if style_global_condition is None:
+            style_global_condition = torch.zeros(
+                (phase_style_condition.shape[0], self._global_style_condition_dim),
+                device=device,
+                dtype=dtype,
+            )
+        gate_input = torch.cat(
+            [
+                style_global_condition.to(device=device, dtype=dtype),
+                phase_style_condition.reshape(phase_style_condition.shape[0], -1).to(device=device, dtype=dtype),
+            ],
+            dim=-1,
+        )
+        gate_hidden = self.temporal_gate_stem(gate_input)
+        near_gate = torch.sigmoid(self.temporal_near_gate_head(gate_hidden))
+        far_gate = torch.sigmoid(self.temporal_far_gate_head(gate_hidden))
+        stage_gates = torch.stack([near_gate, far_gate], dim=1)
+        gated_phase_condition = phase_style_condition.to(device=device, dtype=dtype) * stage_gates
+        self._last_temporal_gate_outputs = {
+            "temporal_near_gate": near_gate,
+            "temporal_far_gate": far_gate,
+            "temporal_near_condition": gated_phase_condition[:, 0, :],
+            "temporal_far_condition": gated_phase_condition[:, 1, :],
+        }
+        return gated_phase_condition
+
+    def pop_last_temporal_gate_outputs(self):
+        payload = self._last_temporal_gate_outputs
+        self._last_temporal_gate_outputs = None
+        return payload
+
+    def inspect_temporal_style_condition(self, style_condition, batch_size: int, *, device, dtype):
+        self._last_temporal_gate_outputs = None
+        style_global_condition, phase_style_condition = self._split_style_condition(style_condition, batch_size)
+        _ = self._apply_temporal_style_gate(
+            style_global_condition,
+            phase_style_condition,
+            device=device,
+            dtype=dtype,
+        )
+        return self.pop_last_temporal_gate_outputs()
 
     def _build_phase_trajectory_bias(self, phase_style_condition, phase_time_mask, *, device, dtype):
         if (

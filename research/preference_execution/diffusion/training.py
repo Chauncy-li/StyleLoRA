@@ -12,10 +12,13 @@ from typing import Any, Dict, Tuple
 import torch
 
 from research.preference_execution.diffusion.style_condition import (
+    build_style_phase_time_mask,
     build_style_condition_feature,
+    phase_style_num_phases,
     resolve_style_condition_feature_set,
     style_condition_valid_mask,
 )
+from research.preference_execution.interaction_state.schema import SCENE_GATE_ORDER
 
 
 def apply_classifier_free_dropout(
@@ -96,9 +99,13 @@ def prepare_preference_conditioned_batch(
     target_preference_scene_vec = batch.get("target_preference_scene_vec")
     safe_preference_scene_vec = batch.get("safe_preference_scene_vec")
     effective_preference_scene_vec = batch.get("effective_preference_scene_vec")
+    target_preference_global_vec = batch.get("target_preference_global_vec")
+    safe_preference_global_vec = batch.get("safe_preference_global_vec")
+    effective_preference_global_vec = batch.get("effective_preference_global_vec")
     local_axis_gate_values = batch.get("local_axis_gate_values")
     scene_gate_values = batch.get("scene_gate_values")
     axis_gate_values = batch.get("axis_gate_values")
+    scene_buckets = batch.get("scene_bucket")
 
     if target_preference_scene_vec is not None:
         target_preference_scene_vec = target_preference_scene_vec.to(device)
@@ -106,6 +113,12 @@ def prepare_preference_conditioned_batch(
         safe_preference_scene_vec = safe_preference_scene_vec.to(device)
     if effective_preference_scene_vec is not None:
         effective_preference_scene_vec = effective_preference_scene_vec.to(device)
+    if target_preference_global_vec is not None:
+        target_preference_global_vec = target_preference_global_vec.to(device)
+    if safe_preference_global_vec is not None:
+        safe_preference_global_vec = safe_preference_global_vec.to(device)
+    if effective_preference_global_vec is not None:
+        effective_preference_global_vec = effective_preference_global_vec.to(device)
     if local_axis_gate_values is not None:
         local_axis_gate_values = local_axis_gate_values.to(device)
     if scene_gate_values is not None:
@@ -118,8 +131,12 @@ def prepare_preference_conditioned_batch(
         batch["style_value_condition"].to(device),
         feature_set=feature_set,
         target_scene_vec=target_preference_scene_vec,
+        safe_scene_vec=safe_preference_scene_vec,
         effective_scene_vec=effective_preference_scene_vec,
         local_axis_gate_values=local_axis_gate_values,
+        target_global_vec=target_preference_global_vec,
+        safe_global_vec=safe_preference_global_vec,
+        scene_buckets=scene_buckets,
     )
     style_feature_valid = style_condition_valid_mask(style_value_condition).to(device)
     if train:
@@ -135,6 +152,23 @@ def prepare_preference_conditioned_batch(
     inputs["style_feature_valid"] = style_feature_valid.float()
     inputs["style_condition_used"] = style_condition_used.float()
     inputs["cfg_guidance_scale"] = float(args.cfg_guidance_scale)
+    inputs["two_stage_far_recovery_mix"] = float(getattr(args, "two_stage_far_recovery_mix", 0.5))
+    inputs["temporal_gate_order_margin"] = float(getattr(args, "temporal_gate_order_margin", 0.02))
+    if phase_style_num_phases(feature_set) > 0:
+        if scene_buckets is None:
+            raise ValueError("phase-wise style conditioning requires scene_bucket metadata in the batch.")
+        phase_time_mask = build_style_phase_time_mask(
+            feature_set,
+            scene_buckets,
+            future_len=int(args.future_len),
+            include_current=True,
+            device=device,
+            dtype=style_value_condition.dtype,
+            two_stage_split_ratio=float(getattr(args, "two_stage_split_ratio", 0.45)),
+            two_stage_transition_ratio=float(getattr(args, "two_stage_transition_ratio", 0.18)),
+        )
+        if phase_time_mask is not None:
+            inputs["phase_time_mask"] = phase_time_mask
 
     optional_condition_tensors = {
         "scene_gate_values": scene_gate_values,
@@ -143,16 +177,77 @@ def prepare_preference_conditioned_batch(
         "target_preference_scene_vec": target_preference_scene_vec,
         "safe_preference_scene_vec": safe_preference_scene_vec,
         "effective_preference_scene_vec": effective_preference_scene_vec,
+        "target_preference_global_vec": target_preference_global_vec,
+        "safe_preference_global_vec": safe_preference_global_vec,
+        "effective_preference_global_vec": effective_preference_global_vec,
+        "preference_ego_current_xycs": batch["ego_current_state"][..., :4].to(device),
+        "preference_neighbor_current_xycs": batch["neighbor_agents_past"][:, : args.predicted_neighbor_num, -1, :4].to(device),
+        "preference_route_lanes_speed_limit_raw": batch["route_lanes_speed_limit"].to(device),
+        "preference_route_lanes_has_speed_limit_raw": batch["route_lanes_has_speed_limit"].to(device),
+        "preference_route_lanes_mask_raw": batch["route_lanes_mask"].to(device),
+        "preference_lanes_speed_limit_raw": batch["lanes_speed_limit"].to(device),
+        "preference_lanes_has_speed_limit_raw": batch["lanes_has_speed_limit"].to(device),
+        "preference_lanes_mask_raw": batch["lanes_mask"].to(device),
     }
     for key, value in optional_condition_tensors.items():
         if value is not None:
             inputs[key] = value
+    inputs["scene_bucket"] = scene_buckets
 
     log_info = {
         "style_feature_valid_ratio": float(style_feature_valid.float().mean().item()),
         "style_condition_used_ratio": float(style_condition_used.float().mean().item()),
         "style_condition_l2": float(torch.linalg.norm(style_value_condition, dim=-1).mean().item()),
     }
+    if target_preference_scene_vec is not None:
+        log_info["target_preference_l1"] = float(target_preference_scene_vec.abs().mean().item())
+    if safe_preference_scene_vec is not None:
+        log_info["safe_preference_l1"] = float(safe_preference_scene_vec.abs().mean().item())
+    if effective_preference_scene_vec is not None:
+        log_info["effective_preference_l1"] = float(effective_preference_scene_vec.abs().mean().item())
+    if target_preference_scene_vec is not None and safe_preference_scene_vec is not None:
+        log_info["target_safe_gap_l1"] = float(
+            (target_preference_scene_vec - safe_preference_scene_vec).abs().mean().item()
+        )
+    if safe_preference_scene_vec is not None and effective_preference_scene_vec is not None:
+        log_info["safe_effective_gap_l1"] = float(
+            (safe_preference_scene_vec - effective_preference_scene_vec).abs().mean().item()
+        )
+    if target_preference_global_vec is not None:
+        log_info["target_preference_global_l1"] = float(target_preference_global_vec.abs().mean().item())
+    if safe_preference_global_vec is not None:
+        log_info["safe_preference_global_l1"] = float(safe_preference_global_vec.abs().mean().item())
+    if effective_preference_global_vec is not None:
+        log_info["effective_preference_global_l1"] = float(effective_preference_global_vec.abs().mean().item())
+    if "phase_time_mask" in inputs:
+        phase_time_mask = torch.as_tensor(inputs["phase_time_mask"], device=device)
+        log_info["phase_mask_mean"] = float(phase_time_mask.mean().item())
+        if phase_time_mask.shape[1] >= 2:
+            log_info["phase_mask_stage0_mean"] = float(phase_time_mask[:, 0].mean().item())
+            log_info["phase_mask_stage1_mean"] = float(phase_time_mask[:, 1].mean().item())
+    if local_axis_gate_values is not None:
+        log_info["local_axis_gate_mean"] = float(local_axis_gate_values.mean().item())
+        log_info["local_axis_gate_min"] = float(local_axis_gate_values.min().item())
+    if scene_gate_values is not None:
+        log_info["scene_gate_mean"] = float(scene_gate_values.mean().item())
+        log_info["scene_gate_max"] = float(scene_gate_values.max().item())
+        if scene_buckets is not None:
+            normalized_scene_buckets = [scene_buckets] if isinstance(scene_buckets, str) else list(scene_buckets)
+            scene_bucket_to_index = {scene_bucket: index for index, scene_bucket in enumerate(SCENE_GATE_ORDER)}
+            target_scene_index = torch.as_tensor(
+                [
+                    scene_bucket_to_index.get(str(scene_bucket), -1)
+                    for scene_bucket in normalized_scene_buckets
+                ],
+                device=device,
+                dtype=torch.long,
+            )
+            valid_scene_mask = target_scene_index >= 0
+            if bool(valid_scene_mask.any()):
+                predicted_scene_index = torch.argmax(scene_gate_values, dim=-1)
+                log_info["scene_gate_alignment_rate"] = float(
+                    (predicted_scene_index[valid_scene_mask] == target_scene_index[valid_scene_mask]).float().mean().item()
+                )
     return inputs, ego_future, neighbors_future, neighbor_mask, log_info
 
 

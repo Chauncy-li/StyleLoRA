@@ -67,6 +67,7 @@ from baseline.common.dataset import ClosedLoopPlannerData
 from baseline.core.register import Registry
 from baseline.model.diff_planner import diffusion_planner
 from baseline.model.diff_planner.loss.diff_loss import diffusion_loss_func
+from baseline.model.style_planner import diffusion_planner as style_diffusion_planner
 from baseline.model.wayformer.wayf_planner import WayFormer
 from baseline.train.manage import flatten_config, manage_best_models, save_model
 from baseline.train.train_utils import resume_model, set_seed
@@ -437,6 +438,14 @@ def _register_train_methods() -> None:
         "diffusion-planner",
         TrainMethodSpec(
             model_builder=lambda args: diffusion_planner.Diffusion_Planner(args),
+            train_epoch_fn=train_epoch_diffusion,
+            validate_epoch_fn=validate_epoch_diffusion,
+        ),
+    )
+    TRAIN_METHOD_REGISTRY.register(
+        "style-planner",
+        TrainMethodSpec(
+            model_builder=lambda args: style_diffusion_planner.Diffusion_Planner(args),
             train_epoch_fn=train_epoch_diffusion,
             validate_epoch_fn=validate_epoch_diffusion,
         ),

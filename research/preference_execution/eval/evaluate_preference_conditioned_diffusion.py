@@ -36,17 +36,24 @@ from research._runtime import DEFAULT_CACHE_TRAIN_VAL_DIR, ensure_repo_on_path
 
 ensure_repo_on_path()
 
-from baseline.model.diff_planner.diffusion_planner import Diffusion_Planner
+from baseline.model.style_planner.diffusion_planner import Diffusion_Planner
 from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
 from research.preference_execution.calibration.builder import STYLE_SWEEP_ORDER
 from research.preference_execution.calibration.schema import calibration_index_path, calibration_output_dir
 from research.preference_execution.diffusion.dataset import PreferenceConditionedPlannerData
 from research.preference_execution.diffusion.style_condition import (
     STYLE_CONDITION_FEATURE_SET_EXEC_V2,
+    STYLE_CONDITION_FEATURE_SET_PHASEWISE_EXEC_V1,
+    STYLE_CONDITION_FEATURE_SET_TWO_STAGE_EXEC_V1,
     build_style_condition_feature,
+    global_style_condition_dim,
+    phase_style_condition_dim,
+    phase_style_flat_dim,
+    phase_style_num_phases,
     resolve_style_condition_feature_set,
     style_condition_dim,
     style_condition_valid_mask,
+    use_temporal_style_gate,
     validate_style_condition_args,
 )
 from research.preference_execution.diffusion.training import prepare_preference_conditioned_batch, write_json
@@ -256,11 +263,20 @@ def _load_model_args(experiment_dir: str, cli_args: argparse.Namespace) -> Names
     )
     model_args.style_condition_feature_set = resolve_style_condition_feature_set(model_args)
     validate_style_condition_args(model_args.condition_field, model_args.style_condition_feature_set)
+    model_args.global_style_condition_dim = global_style_condition_dim(
+        model_args.style_condition_feature_set,
+        base_global_dim=len(AXIS_GATE_ORDER),
+    )
+    model_args.phase_style_condition_dim = phase_style_condition_dim(model_args.style_condition_feature_set)
+    model_args.phase_style_num_phases = phase_style_num_phases(model_args.style_condition_feature_set)
+    model_args.phase_style_flat_dim = phase_style_flat_dim(model_args.style_condition_feature_set)
     model_args.style_value_dim = style_condition_dim(
         model_args.style_condition_feature_set,
         base_global_dim=len(AXIS_GATE_ORDER),
     )
     model_args.use_style_condition = True
+    model_args.use_phase_style_condition = bool(model_args.phase_style_flat_dim > 0)
+    model_args.use_temporal_style_gate = use_temporal_style_gate(model_args.style_condition_feature_set)
     model_args.guidance_fn = None
     model_args.normalization_file_path = _resolve_normalization_path(model_args)
     model_args.state_normalizer = StateNormalizer.from_json(model_args)
@@ -818,10 +834,14 @@ def _build_eval_style_condition(
     eval_args: argparse.Namespace,
     device: torch.device,
 ) -> torch.Tensor:
-    if model_args.style_condition_feature_set == STYLE_CONDITION_FEATURE_SET_EXEC_V2:
+    if model_args.style_condition_feature_set in (
+        STYLE_CONDITION_FEATURE_SET_EXEC_V2,
+        STYLE_CONDITION_FEATURE_SET_PHASEWISE_EXEC_V1,
+        STYLE_CONDITION_FEATURE_SET_TWO_STAGE_EXEC_V1,
+    ):
         if eval_args.condition_source != "effective":
             raise ValueError(
-                "style_condition_feature_set='exec_v2_effective_gap' currently requires "
+                "phase-aware effective condition features currently require "
                 "--condition_source effective during evaluation."
             )
 
@@ -832,6 +852,11 @@ def _build_eval_style_condition(
         )
         effective_scene_vec = torch.as_tensor(
             calibration_record["sweep"]["effective_scene_vecs"][style_label],
+            dtype=torch.float32,
+            device=device,
+        )
+        safe_scene_vec = torch.as_tensor(
+            calibration_record["sweep"]["safe_scene_vecs"][style_label],
             dtype=torch.float32,
             device=device,
         )
@@ -849,8 +874,20 @@ def _build_eval_style_condition(
             base_global_vec,
             feature_set=model_args.style_condition_feature_set,
             target_scene_vec=target_scene_vec,
+            safe_scene_vec=safe_scene_vec,
             effective_scene_vec=effective_scene_vec,
             local_axis_gate_values=local_axis_gate_values,
+            target_global_vec=torch.as_tensor(
+                _make_global_vec(axis_names, _tensor_to_numpy(target_scene_vec)),
+                dtype=torch.float32,
+                device=device,
+            ),
+            safe_global_vec=torch.as_tensor(
+                _make_global_vec(axis_names, _tensor_to_numpy(safe_scene_vec)),
+                dtype=torch.float32,
+                device=device,
+            ),
+            scene_buckets=str(sample["scene_bucket"]),
         )
 
     sweep_scene_key = f"{eval_args.condition_source}_scene_vecs"
@@ -876,6 +913,7 @@ def _evaluate_sample(
     dataset_index: int,
 ) -> Dict[str, Any]:
     batch = _tensor_batch_from_sample(sample)
+    batch["scene_bucket"] = str(sample["scene_bucket"])
     base_inputs, _, _, _, _ = prepare_preference_conditioned_batch(batch, model_args, train=False, aug=None)
 
     observed_rollout_vecs: List[np.ndarray] = []

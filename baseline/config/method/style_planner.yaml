@@ -1,0 +1,22 @@
+# baseline/config/method/style_planner.yaml
+#
+# Method-level config for the style planner research branch. It intentionally
+# mirrors diffusion_planner.yaml so the fork starts from the same backbone.
+
+name: "style-planner"
+
+model:
+  encoder_depth: 3
+  decoder_depth: 3
+  num_heads: 6
+  hidden_dim: 192
+  encoder_drop_path_rate: 0.1
+  decoder_drop_path_rate: 0.1
+
+  guidance_fn: null
+  diffusion_model_type: "x_start"
+
+  predicted_neighbor_num: 10
+
+  use_ema: true
+  resume_model_path: null

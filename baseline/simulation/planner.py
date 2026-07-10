@@ -36,8 +36,15 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 
 from baseline.data_process.data_processor import DataProcessor
 from baseline.core.register import Registry
-from baseline.model.diff_planner.diffusion_planner import Diffusion_Planner
+from baseline.model.diff_planner.diffusion_planner import Diffusion_Planner as BaseDiffusionPlannerModel
+from baseline.model.style_planner.diffusion_planner import Diffusion_Planner as StyleDiffusionPlannerModel
 from baseline.model.wayformer.wayf_planner import WayFormer
+from research.preference_execution.runtime import (
+    OnlinePreferenceConditioner,
+    append_runtime_trace_csv,
+    append_runtime_trace_jsonl,
+    build_runtime_trace_row,
+)
 from baseline.simulation.render import NuplanScenarioRender
 from baseline.utils.config import Config
 
@@ -64,6 +71,8 @@ def load_checkpoint_safely(model, ckpt_path: str, device: str):
 
 
 class DiffusionPlanner(AbstractPlanner):
+    planner_model_cls = BaseDiffusionPlannerModel
+    planner_name = "diffusion_planner"
     """NuPlan 仿真环境下的 Diffusion Planner 封装。"""
 
     def __init__(
@@ -84,8 +93,12 @@ class DiffusionPlanner(AbstractPlanner):
         self._device = device
         self._ckpt_path = ckpt_path
         self._ema_enabled = enable_ema
+        self._last_runtime_preference_debug: Optional[Dict[str, object]] = None
+        self._runtime_trace_export_enabled = bool(getattr(config, "runtime_trace_export_enabled", True))
+        self._runtime_preference_trace_path: Optional[str] = None
+        self._runtime_preference_csv_path: Optional[str] = None
 
-        self._planner = Diffusion_Planner(config)
+        self._planner = self.planner_model_cls(config)
         self.data_processor = DataProcessor(config)
         self.observation_normalizer = config.observation_normalizer
 
@@ -114,7 +127,7 @@ class DiffusionPlanner(AbstractPlanner):
             print(f"Raw step export enabled. Output dir: {self.raw_data_save_dir}")
 
     def name(self) -> str:
-        return "diffusion_planner"
+        return self.planner_name
 
     def observation_type(self) -> Type[Observation]:
         return DetectionsTracks
@@ -134,14 +147,23 @@ class DiffusionPlanner(AbstractPlanner):
         # 每个 scenario 初始化时重置导出状态
         self._scenario_index += 1
         self._step_export_index = 0
+        self._last_runtime_preference_debug = None
         if self.raw_data_save_dir:
             scenario_dir = os.path.join(self.raw_data_save_dir, f"scenario_{self._scenario_index:06d}")
             os.makedirs(scenario_dir, exist_ok=True)
             self._scenario_raw_dir = scenario_dir
             self._raw_trace_path = os.path.join(scenario_dir, "step_trace.jsonl")
+            if self._runtime_trace_export_enabled:
+                self._runtime_preference_trace_path = os.path.join(scenario_dir, "runtime_preference_trace.jsonl")
+                self._runtime_preference_csv_path = os.path.join(scenario_dir, "runtime_preference_trace.csv")
+            else:
+                self._runtime_preference_trace_path = None
+                self._runtime_preference_csv_path = None
         else:
             self._scenario_raw_dir = None
             self._raw_trace_path = None
+            self._runtime_preference_trace_path = None
+            self._runtime_preference_csv_path = None
 
         if self._ckpt_path:
             self._planner = load_checkpoint_safely(self._planner, self._ckpt_path, self._device)
@@ -174,9 +196,12 @@ class DiffusionPlanner(AbstractPlanner):
 
     def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
         with torch.no_grad():
+            self._last_runtime_preference_debug = None
             raw_inputs = self.planner_input_to_model_inputs(current_input)
             normalized_inputs = self.observation_normalizer(raw_inputs)
-            _, outputs = self._planner(normalized_inputs)
+            model_inputs = self._augment_model_inputs(raw_inputs, normalized_inputs)
+            _, outputs = self._planner(model_inputs)
+            self._update_runtime_preference_debug(outputs)
 
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(outputs, current_input.history.ego_states)
@@ -188,6 +213,16 @@ class DiffusionPlanner(AbstractPlanner):
             self._export_step_bundle(current_input, raw_inputs, outputs)
 
         return trajectory
+
+    def _augment_model_inputs(
+        self,
+        raw_inputs: Dict[str, torch.Tensor],
+        normalized_inputs: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        return normalized_inputs
+
+    def _update_runtime_preference_debug(self, outputs: Dict[str, torch.Tensor]) -> None:
+        return
 
     def _render_and_save(self, current_input: PlannerInput, trajectory: InterpolatedTrajectory) -> None:
         try:
@@ -268,6 +303,17 @@ class DiffusionPlanner(AbstractPlanner):
                 "time_us": time_us,
                 "file_name": file_name,
             }
+            if self._last_runtime_preference_debug is not None:
+                row["runtime_preference"] = self._last_runtime_preference_debug
+                if self._runtime_preference_trace_path is not None and self._runtime_preference_csv_path is not None:
+                    runtime_trace_row = build_runtime_trace_row(
+                        step_index=step_index,
+                        iteration_index=iteration_index,
+                        time_us=time_us,
+                        debug=self._last_runtime_preference_debug,
+                    )
+                    append_runtime_trace_jsonl(self._runtime_preference_trace_path, runtime_trace_row)
+                    append_runtime_trace_csv(self._runtime_preference_csv_path, runtime_trace_row)
             with open(self._raw_trace_path, "a", encoding="utf-8") as file_obj:
                 file_obj.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -579,11 +625,88 @@ class Wayformer(AbstractPlanner):
                 file_obj.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+class StylePlanner(DiffusionPlanner):
+    """Isolated closed-loop wrapper for the style-planner research branch."""
+
+    planner_model_cls = StyleDiffusionPlannerModel
+    planner_name = "style_planner"
+
+    def __init__(
+        self,
+        config: Config,
+        ckpt_path: str,
+        past_trajectory_sampling: TrajectorySampling,
+        future_trajectory_sampling: TrajectorySampling,
+        enable_ema: bool = True,
+        device: str = "cpu",
+    ):
+        super().__init__(
+            config=config,
+            ckpt_path=ckpt_path,
+            past_trajectory_sampling=past_trajectory_sampling,
+            future_trajectory_sampling=future_trajectory_sampling,
+            enable_ema=enable_ema,
+            device=device,
+        )
+        runtime_preference_enabled = bool(getattr(config, "runtime_preference_enabled", True))
+        self._online_preference_conditioner = (
+            OnlinePreferenceConditioner(config) if runtime_preference_enabled else None
+        )
+
+    def set_runtime_preference(self, style_label: str | None = None, intensity: float | None = None) -> None:
+        if self._online_preference_conditioner is None:
+            raise RuntimeError("runtime preference control is disabled for this StylePlanner instance.")
+        self._online_preference_conditioner.set_command(style_label=style_label, intensity=intensity)
+
+    def current_runtime_preference(self) -> Dict[str, object]:
+        if self._online_preference_conditioner is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "style_label": self._online_preference_conditioner.style_label,
+            "style_intensity": self._online_preference_conditioner.style_intensity,
+            "stats_path": self._online_preference_conditioner.stats_path,
+        }
+
+    def _augment_model_inputs(
+        self,
+        raw_inputs: Dict[str, torch.Tensor],
+        normalized_inputs: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        if self._online_preference_conditioner is None:
+            return normalized_inputs
+        model_inputs, debug = self._online_preference_conditioner.apply(
+            raw_inputs,
+            normalized_inputs,
+            device=self._device,
+        )
+        self._last_runtime_preference_debug = debug
+        return model_inputs
+
+    def _update_runtime_preference_debug(self, outputs: Dict[str, torch.Tensor]) -> None:
+        if self._last_runtime_preference_debug is None:
+            return
+        temporal_keys = (
+            "temporal_near_gate",
+            "temporal_far_gate",
+            "temporal_near_condition",
+            "temporal_far_condition",
+        )
+        for key in temporal_keys:
+            value = outputs.get(key)
+            if value is None or not torch.is_tensor(value) or value.ndim < 2:
+                continue
+            self._last_runtime_preference_debug[key] = [
+                float(item) for item in value[0].detach().cpu().reshape(-1).tolist()
+            ]
+
+
 def register_simulation_planners() -> None:
     """注册可用于 NuPlan 仿真的 planner。"""
     if len(SIMULATION_PLANNER_REGISTRY) > 0:
         return
     SIMULATION_PLANNER_REGISTRY.register("diffusion_planner", DiffusionPlanner)
+    SIMULATION_PLANNER_REGISTRY.register("style_planner", StylePlanner)
     SIMULATION_PLANNER_REGISTRY.register("wayformer", Wayformer)
 
 

@@ -19,6 +19,7 @@ from .schema import PROJECTION_LEVEL_ORDER, PROJECTION_SCHEMA_VERSION
 from .stats import VALID_RECORD_SCOPES, VALID_STYLE_LABELS, _bucket_levels
 
 TARGET_STYLE_MODES = ("self", "fixed")
+TARGET_INTENSITY_MODES = ("prototype", "observed", "fixed")
 
 
 def _write_json(path: str, payload: object) -> None:
@@ -58,7 +59,9 @@ class PreferenceProjectionApplier:
         output_summary_path: str,
         record_scope: str = "split_valid",
         target_style_mode: str = "self",
+        target_intensity_mode: str = "observed",
         fixed_style_label: str = "aggressive",
+        fixed_style_intensity: float = 1.0,
         min_bucket_size: int = 128,
         log_interval: int = 5000,
     ) -> None:
@@ -70,9 +73,17 @@ class PreferenceProjectionApplier:
             raise ValueError(
                 f"target_style_mode must be one of {TARGET_STYLE_MODES}, got {target_style_mode!r}"
             )
+        if target_intensity_mode not in TARGET_INTENSITY_MODES:
+            raise ValueError(
+                f"target_intensity_mode must be one of {TARGET_INTENSITY_MODES}, got {target_intensity_mode!r}"
+            )
         if fixed_style_label not in VALID_STYLE_LABELS:
             raise ValueError(
                 f"fixed_style_label must be one of {VALID_STYLE_LABELS}, got {fixed_style_label!r}"
+            )
+        if not (0.0 <= float(fixed_style_intensity) <= 1.0):
+            raise ValueError(
+                f"fixed_style_intensity must be within [0, 1], got {fixed_style_intensity!r}"
             )
         if min_bucket_size <= 0:
             raise ValueError(f"min_bucket_size must be > 0, got {min_bucket_size}")
@@ -85,7 +96,9 @@ class PreferenceProjectionApplier:
         self.output_summary_path = output_summary_path
         self.record_scope = record_scope
         self.target_style_mode = target_style_mode
+        self.target_intensity_mode = target_intensity_mode
         self.fixed_style_label = fixed_style_label
+        self.fixed_style_intensity = float(fixed_style_intensity)
         self.min_bucket_size = int(min_bucket_size)
         self.log_interval = int(log_interval)
 
@@ -111,6 +124,10 @@ class PreferenceProjectionApplier:
         scene_counter: Counter[str] = Counter()
         clipping_by_scene: Dict[str, list[float]] = defaultdict(list)
         clipping_by_target_style: Dict[str, list[float]] = defaultdict(list)
+        target_intensity_by_style: Dict[str, list[float]] = defaultdict(list)
+        observed_intensity_by_style: Dict[str, list[float]] = defaultdict(list)
+        target_intensity_sum = 0.0
+        observed_intensity_sum = 0.0
 
         tmp_index_path = f"{self.output_index_path}.tmp"
         with open(tmp_index_path, "w", encoding="utf-8") as output_file:
@@ -135,13 +152,19 @@ class PreferenceProjectionApplier:
                     target_style = str(projection_record["target_style_label"])
                     clipping_fraction = float(projection_record["clipped_axis_fraction"])
                     projection_l1 = float(projection_record["projection_l1"])
+                    target_intensity_alpha = float(projection_record["target_intensity_alpha"])
+                    observed_intensity_alpha = float(projection_record["observed_intensity_alpha"])
 
                     scene_counter[scene_bucket] += 1
                     target_style_counter[target_style] += 1
                     selected_level_counter[str(projection_record["selected_bucket_level"])] += 1
                     clipping_by_scene[scene_bucket].append(clipping_fraction)
                     clipping_by_target_style[target_style].append(clipping_fraction)
+                    target_intensity_by_style[target_style].append(target_intensity_alpha)
+                    observed_intensity_by_style[target_style].append(observed_intensity_alpha)
                     projection_l1_sum += projection_l1
+                    target_intensity_sum += target_intensity_alpha
+                    observed_intensity_sum += observed_intensity_alpha
                     clipped_axis_count += int(projection_record["clipped_axis_count"])
                     if clipping_fraction > 0.0:
                         clipped_record_count += 1
@@ -165,7 +188,9 @@ class PreferenceProjectionApplier:
             "output_index_path": self.output_index_path,
             "record_scope": self.record_scope,
             "target_style_mode": self.target_style_mode,
+            "target_intensity_mode": self.target_intensity_mode,
             "fixed_style_label": self.fixed_style_label,
+            "fixed_style_intensity": self.fixed_style_intensity,
             "min_bucket_size": self.min_bucket_size,
             "total_seen": total_seen,
             "total_written": total_written,
@@ -178,6 +203,8 @@ class PreferenceProjectionApplier:
             "clipped_record_rate": float(clipped_record_count / max(total_written, 1)),
             "mean_clipped_axis_fraction": float(clipped_axis_count / max(total_written * 3, 1)),
             "mean_projection_l1": float(projection_l1_sum / max(total_written, 1)),
+            "mean_target_intensity_alpha": float(target_intensity_sum / max(total_written, 1)),
+            "mean_observed_intensity_alpha": float(observed_intensity_sum / max(total_written, 1)),
             "mean_clipped_axis_fraction_by_scene": {
                 scene_bucket: float(np.mean(values)) if values else 0.0
                 for scene_bucket, values in sorted(clipping_by_scene.items())
@@ -185,6 +212,14 @@ class PreferenceProjectionApplier:
             "mean_clipped_axis_fraction_by_target_style": {
                 style_label: float(np.mean(values)) if values else 0.0
                 for style_label, values in sorted(clipping_by_target_style.items())
+            },
+            "mean_target_intensity_alpha_by_target_style": {
+                style_label: float(np.mean(values)) if values else 0.0
+                for style_label, values in sorted(target_intensity_by_style.items())
+            },
+            "mean_observed_intensity_alpha_by_target_style": {
+                style_label: float(np.mean(values)) if values else 0.0
+                for style_label, values in sorted(observed_intensity_by_style.items())
             },
         }
         _write_json(self.output_summary_path, summary)
@@ -196,10 +231,25 @@ class PreferenceProjectionApplier:
             return None
 
         axis_names = list(style_axis_names_for_scene(scene_bucket))
-        target_style_label = self._resolve_target_style_label(record)
-        target_vector = self._resolve_target_vector(stats, scene_bucket, target_style_label)
-        if target_vector is None:
+        scene_prototypes = self._resolve_scene_style_prototypes(stats, scene_bucket)
+        if scene_prototypes is None:
             return None
+        target_style_label = self._resolve_target_style_label(record)
+        observed_style_label = self._resolve_observed_style_label(record)
+        observed_intensity_alpha, observed_intensity_beta = self._estimate_observed_intensity(
+            record,
+            observed_style_label,
+            scene_prototypes,
+        )
+        target_intensity_alpha, target_intensity_beta = self._resolve_target_intensity(
+            target_style_label=target_style_label,
+            observed_intensity_alpha=observed_intensity_alpha,
+        )
+        target = self._build_interpolated_target_vector(
+            scene_prototypes,
+            target_style_label=target_style_label,
+            target_intensity_alpha=target_intensity_alpha,
+        )
 
         selected_level, selected_bucket_key, selected_bucket_stats = self._select_bucket_stats(stats, record)
         if selected_bucket_stats is None:
@@ -207,7 +257,6 @@ class PreferenceProjectionApplier:
 
         lower = np.asarray(selected_bucket_stats["lower"], dtype=np.float32)
         upper = np.asarray(selected_bucket_stats["upper"], dtype=np.float32)
-        target = np.asarray(target_vector, dtype=np.float32)
         projected = np.clip(target, lower, upper)
         delta = projected - target
         clipped_mask = (np.abs(delta) > 1e-6).astype(np.int64)
@@ -219,6 +268,7 @@ class PreferenceProjectionApplier:
             "scene_bucket": scene_bucket,
             "style_label": str(record.get("style_label", "unknown")),
             "target_style_label": target_style_label,
+            "observed_style_label": observed_style_label,
             "subset_id": str(record.get("subset_id", "invalid")),
             "axis_names": axis_names,
             "target_preference_vec": [float(value) for value in target.tolist()],
@@ -230,6 +280,10 @@ class PreferenceProjectionApplier:
             "clipped_axis_count": int(np.sum(clipped_mask)),
             "clipped_axis_fraction": float(np.mean(clipped_mask)),
             "projection_l1": float(np.mean(np.abs(delta))),
+            "observed_intensity_alpha": float(observed_intensity_alpha),
+            "observed_intensity_beta": float(observed_intensity_beta),
+            "target_intensity_alpha": float(target_intensity_alpha),
+            "target_intensity_beta": float(target_intensity_beta),
             "selected_bucket_level": selected_level,
             "selected_bucket_key": selected_bucket_key,
             "selected_bucket_count": int(selected_bucket_stats["count"]),
@@ -241,21 +295,104 @@ class PreferenceProjectionApplier:
     def _resolve_target_style_label(self, record: Mapping[str, object]) -> str:
         if self.target_style_mode == "fixed":
             return self.fixed_style_label
-        observed_style = str(record.get("style_label", "unknown"))
+        observed_style = self._resolve_observed_style_label(record)
         return observed_style if observed_style in VALID_STYLE_LABELS else self.fixed_style_label
 
-    def _resolve_target_vector(
+    def _resolve_observed_style_label(self, record: Mapping[str, object]) -> str:
+        observed_style = str(record.get("style_label", "unknown"))
+        return observed_style if observed_style in VALID_STYLE_LABELS else "normal"
+
+    def _resolve_scene_style_prototypes(
         self,
         stats: Mapping[str, object],
         scene_bucket: str,
-        target_style_label: str,
-    ) -> Sequence[float] | None:
+    ) -> Dict[str, np.ndarray] | None:
         style_prototypes = stats.get("style_prototypes", {})
         scene_stats = style_prototypes.get(scene_bucket, {})
-        style_stats = scene_stats.get("styles", {}).get(target_style_label, None)
-        if style_stats is not None:
-            return style_stats.get("mean", None)
-        return scene_stats.get("scene_mean", None)
+        scene_mean = scene_stats.get("scene_mean", None)
+        styles = scene_stats.get("styles", {})
+        normal_mean = styles.get("normal", {}).get("mean", scene_mean)
+        if normal_mean is None:
+            return None
+
+        prototypes: Dict[str, np.ndarray] = {}
+        for style_label in VALID_STYLE_LABELS:
+            if style_label == "normal":
+                candidate = normal_mean
+            else:
+                candidate = styles.get(style_label, {}).get("mean", normal_mean)
+            candidate_vec = np.asarray(candidate, dtype=np.float32)
+            if candidate_vec.shape[0] != 3:
+                return None
+            prototypes[style_label] = candidate_vec
+        return prototypes
+
+    def _estimate_observed_intensity(
+        self,
+        record: Mapping[str, object],
+        observed_style_label: str,
+        scene_prototypes: Mapping[str, np.ndarray],
+    ) -> tuple[float, float]:
+        if observed_style_label == "normal":
+            return 0.0, 0.0
+
+        observed_vec = np.asarray(record.get("style_performance_vec", []), dtype=np.float32)
+        if observed_vec.shape[0] != 3:
+            fallback_alpha = 1.0
+            return fallback_alpha, self._signed_intensity_beta(observed_style_label, fallback_alpha)
+
+        normal_vec = scene_prototypes["normal"]
+        style_vec = scene_prototypes[observed_style_label]
+        direction = style_vec - normal_vec
+        denom = float(np.dot(direction, direction))
+        if denom <= 1e-8:
+            alpha = 1.0
+        else:
+            alpha = float(np.dot(observed_vec - normal_vec, direction) / denom)
+            alpha = float(np.clip(alpha, 0.0, 1.0))
+        return alpha, self._signed_intensity_beta(observed_style_label, alpha)
+
+    def _resolve_target_intensity(
+        self,
+        *,
+        target_style_label: str,
+        observed_intensity_alpha: float,
+    ) -> tuple[float, float]:
+        if target_style_label == "normal":
+            return 0.0, 0.0
+
+        if self.target_intensity_mode == "prototype":
+            alpha = 1.0
+        elif self.target_intensity_mode == "observed":
+            alpha = float(observed_intensity_alpha)
+        elif self.target_intensity_mode == "fixed":
+            alpha = float(self.fixed_style_intensity)
+        else:
+            raise ValueError(f"Unsupported target_intensity_mode: {self.target_intensity_mode!r}")
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        return alpha, self._signed_intensity_beta(target_style_label, alpha)
+
+    def _build_interpolated_target_vector(
+        self,
+        scene_prototypes: Mapping[str, np.ndarray],
+        *,
+        target_style_label: str,
+        target_intensity_alpha: float,
+    ) -> np.ndarray:
+        normal_vec = np.asarray(scene_prototypes["normal"], dtype=np.float32)
+        if target_style_label == "normal" or target_intensity_alpha <= 1e-6:
+            return normal_vec.copy()
+        style_vec = np.asarray(scene_prototypes[target_style_label], dtype=np.float32)
+        return normal_vec + float(target_intensity_alpha) * (style_vec - normal_vec)
+
+    @staticmethod
+    def _signed_intensity_beta(style_label: str, alpha: float) -> float:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        if style_label == "aggressive":
+            return alpha
+        if style_label == "conservative":
+            return -alpha
+        return 0.0
 
     def _select_bucket_stats(
         self,

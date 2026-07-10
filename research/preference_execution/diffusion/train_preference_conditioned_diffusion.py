@@ -28,9 +28,9 @@ from research._runtime import ensure_repo_on_path
 
 ensure_repo_on_path()
 
-from baseline.model.diff_planner.diffusion_planner import Diffusion_Planner
-from baseline.model.diff_planner.layer.decoder import Decoder
-from baseline.model.diff_planner.loss.diff_loss import diffusion_loss_func
+from baseline.model.style_planner.diffusion_planner import Diffusion_Planner
+from baseline.model.style_planner.layer.decoder import Decoder
+from baseline.model.style_planner.loss.diff_loss import diffusion_loss_func
 from baseline.train.manage import save_model
 from baseline.train.train_utils import resume_model, set_seed
 from baseline.utils.logger import WandbLogger as Logger
@@ -38,9 +38,15 @@ from baseline.utils.lr_schedule import CosineAnnealingWarmUpRestarts
 from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
 from research._runtime import DEFAULT_CACHE_TRAIN_VAL_DIR, DEFAULT_NUM_WORKERS, DEFAULT_RECORD_ROOT
 from research.preference_execution.diffusion.dataset import PreferenceConditionedPlannerData
+from research.preference_execution.diffusion.preference_loss import compute_preference_aux_losses
 from research.preference_execution.diffusion.style_condition import (
     STYLE_CONDITION_FEATURE_SET_CHOICES,
+    global_style_condition_dim,
+    phase_style_condition_dim,
+    phase_style_flat_dim,
+    phase_style_num_phases,
     style_condition_dim,
+    use_temporal_style_gate,
     validate_style_condition_args,
 )
 from research.preference_execution.diffusion.training import (
@@ -57,6 +63,8 @@ from research.style_scene_split.defaults import (
 EXPERIMENT_PRESET_MANUAL = "manual"
 EXPERIMENT_PRESET_BASELINE_9D = "baseline_9d"
 EXPERIMENT_PRESET_EXEC_V2_CONDITION_ONLY = "exec_v2_condition_only"
+EXPERIMENT_PRESET_PHASEWISE_EXEC_V1_CONDITION_ONLY = "phasewise_exec_v1_condition_only"
+EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS = "two_stage_exec_v1_pref_loss"
 EXPERIMENT_PRESET_SAMPLER_ONLY_MILD = "sampler_only_mild"
 EXPERIMENT_PRESET_EXEC_V2_MILD_SAMPLER = "exec_v2_mild_sampler"
 
@@ -64,6 +72,8 @@ EXPERIMENT_PRESET_CHOICES = (
     EXPERIMENT_PRESET_MANUAL,
     EXPERIMENT_PRESET_BASELINE_9D,
     EXPERIMENT_PRESET_EXEC_V2_CONDITION_ONLY,
+    EXPERIMENT_PRESET_PHASEWISE_EXEC_V1_CONDITION_ONLY,
+    EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS,
     EXPERIMENT_PRESET_SAMPLER_ONLY_MILD,
     EXPERIMENT_PRESET_EXEC_V2_MILD_SAMPLER,
 )
@@ -71,6 +81,8 @@ EXPERIMENT_PRESET_CHOICES = (
 PRESET_DEFAULT_EXPERIMENT_NAMES = {
     EXPERIMENT_PRESET_BASELINE_9D: "effective_preference_global_vec_baseline_9d",
     EXPERIMENT_PRESET_EXEC_V2_CONDITION_ONLY: "effective_preference_global_vec_exec_v2_condition_only",
+    EXPERIMENT_PRESET_PHASEWISE_EXEC_V1_CONDITION_ONLY: "effective_preference_global_vec_phasewise_exec_v1_condition_only",
+    EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS: "effective_preference_global_vec_two_stage_exec_v1_pref_loss",
     EXPERIMENT_PRESET_SAMPLER_ONLY_MILD: "effective_preference_global_vec_sampler_only_mild",
     EXPERIMENT_PRESET_EXEC_V2_MILD_SAMPLER: "effective_preference_global_vec_exec_v2_mild_sampler",
 }
@@ -114,13 +126,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cfg_dropout_prob", type=float, default=0.15)
     parser.add_argument("--cfg_guidance_scale", type=float, default=1.5)
+    parser.add_argument("--two_stage_split_ratio", type=float, default=0.45)
+    parser.add_argument("--two_stage_transition_ratio", type=float, default=0.18)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--notes", default="")
     parser.add_argument("--online_logger", default="swanlab", choices=("swanlab", "wandb", "disabled"))
     parser.add_argument("--use_online_logger", action="store_true", default=True)
     parser.add_argument("--disable_online_logger", action="store_true")
-    parser.add_argument("--online_project_name", default="Diffusion-Planner")
+    parser.add_argument("--online_project_name", default="Style-Planner")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--train_epochs", type=int, default=30)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
@@ -128,6 +142,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warm_up_epoch", type=int, default=5)
     parser.add_argument("--grad_clip_norm", type=float, default=5.0)
     parser.add_argument("--alpha_planning_loss", type=float, default=1.0)
+    parser.add_argument("--preference_aux_loss_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_near_loss_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_gate_loss_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_gate_target_loss_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_gate_order_loss_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_gate_order_margin", type=float, default=0.02)
+    parser.add_argument("--preference_loss_dt", type=float, default=0.1)
+    parser.add_argument("--temporal_gate_hidden_dim", type=int, default=192)
+    parser.add_argument("--two_stage_far_recovery_mix", type=float, default=0.5)
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--pin_memory", action="store_true", default=True)
     parser.add_argument("--disable_pin_memory", action="store_true")
@@ -202,6 +225,33 @@ def _apply_experiment_preset(
             "scene_weight_lane_change": 1.0,
             "scene_weight_default": 1.0,
         }
+    elif preset == EXPERIMENT_PRESET_PHASEWISE_EXEC_V1_CONDITION_ONLY:
+        preset_overrides = {
+            "style_condition_feature_set": "phasewise_exec_v1",
+            "balance_scene_buckets": False,
+            "scene_weight_free_drive": 1.0,
+            "scene_weight_car_follow": 1.0,
+            "scene_weight_lane_change": 1.0,
+            "scene_weight_default": 1.0,
+        }
+    elif preset == EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS:
+        preset_overrides = {
+            "style_condition_feature_set": "two_stage_exec_v1",
+            "balance_scene_buckets": False,
+            "scene_weight_free_drive": 1.0,
+            "scene_weight_car_follow": 1.0,
+            "scene_weight_lane_change": 1.0,
+            "scene_weight_default": 1.0,
+            "preference_aux_loss_weight": 0.20,
+            "temporal_near_loss_weight": 0.05,
+            "temporal_gate_loss_weight": 0.05,
+            "temporal_gate_target_loss_weight": 0.05,
+            "temporal_gate_order_loss_weight": 0.02,
+            "temporal_gate_order_margin": 0.02,
+            "two_stage_split_ratio": 0.45,
+            "two_stage_transition_ratio": 0.18,
+            "two_stage_far_recovery_mix": 0.50,
+        }
     elif preset == EXPERIMENT_PRESET_SAMPLER_ONLY_MILD:
         preset_overrides = {
             "style_condition_feature_set": "global_only",
@@ -242,10 +292,16 @@ def _build_args() -> argparse.Namespace:
         args.use_online_logger = False
     _apply_experiment_preset(args, default_experiment_name=default_experiment_name)
     validate_style_condition_args(args.condition_field, args.style_condition_feature_set)
-    args.name = "diffusion-planner"
+    args.name = "style-planner"
     args.guidance_fn = None
+    args.global_style_condition_dim = global_style_condition_dim(args.style_condition_feature_set, base_global_dim=9)
+    args.phase_style_condition_dim = phase_style_condition_dim(args.style_condition_feature_set)
+    args.phase_style_num_phases = phase_style_num_phases(args.style_condition_feature_set)
+    args.phase_style_flat_dim = phase_style_flat_dim(args.style_condition_feature_set)
     args.style_value_dim = style_condition_dim(args.style_condition_feature_set, base_global_dim=9)
     args.use_style_condition = True
+    args.use_phase_style_condition = bool(args.phase_style_flat_dim > 0)
+    args.use_temporal_style_gate = use_temporal_style_gate(args.style_condition_feature_set)
     args.use_wandb = args.use_online_logger
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
@@ -341,7 +397,7 @@ def _train_epoch(
         )
         optimizer.zero_grad(set_to_none=True)
         loss_dict: Dict[str, Any] = {}
-        loss_dict, _ = diffusion_loss_func(
+        loss_dict, decoder_output = diffusion_loss_func(
             model,
             inputs,
             model.sde.marginal_prob,
@@ -350,9 +406,34 @@ def _train_epoch(
             loss_dict,
             args.diffusion_model_type,
         )
-        loss_dict["loss"] = (
+        diffusion_base_loss = (
             loss_dict["neighbor_prediction_loss"] + args.alpha_planning_loss * loss_dict["ego_planning_loss"]
         )
+        loss_dict["diffusion_base_loss"] = diffusion_base_loss
+        pref_metrics = compute_preference_aux_losses(
+            decoder_output=decoder_output,
+            inputs=inputs,
+            neighbors_future=neighbors_future,
+            neighbor_future_mask=mask,
+            state_normalizer=args.state_normalizer,
+            model_type=args.diffusion_model_type,
+            dt=float(args.preference_loss_dt),
+        )
+        for key, value in pref_metrics.items():
+            loss_dict[key] = value
+        loss_dict["loss"] = diffusion_base_loss
+        if float(args.preference_aux_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.preference_aux_loss_weight) * loss_dict["preference_proxy_loss"]
+        if float(args.temporal_near_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_near_loss_weight) * loss_dict["temporal_near_condition_loss"]
+        if float(args.temporal_gate_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_gate_loss_weight) * loss_dict["temporal_far_condition_loss"]
+        if float(args.temporal_gate_target_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_gate_target_loss_weight) * (
+                loss_dict["temporal_near_gate_target_loss"] + loss_dict["temporal_far_gate_target_loss"]
+            )
+        if float(args.temporal_gate_order_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_gate_order_loss_weight) * loss_dict["temporal_gate_order_loss"]
         loss_dict["loss"].backward()
         nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
         optimizer.step()
@@ -387,7 +468,7 @@ def _validate_epoch(
             aug=None,
         )
         loss_dict: Dict[str, Any] = {}
-        loss_dict, _ = diffusion_loss_func(
+        loss_dict, decoder_output = diffusion_loss_func(
             model,
             inputs,
             model.sde.marginal_prob,
@@ -396,9 +477,34 @@ def _validate_epoch(
             loss_dict,
             args.diffusion_model_type,
         )
-        loss_dict["loss"] = (
+        diffusion_base_loss = (
             loss_dict["neighbor_prediction_loss"] + args.alpha_planning_loss * loss_dict["ego_planning_loss"]
         )
+        loss_dict["diffusion_base_loss"] = diffusion_base_loss
+        pref_metrics = compute_preference_aux_losses(
+            decoder_output=decoder_output,
+            inputs=inputs,
+            neighbors_future=neighbors_future,
+            neighbor_future_mask=mask,
+            state_normalizer=args.state_normalizer,
+            model_type=args.diffusion_model_type,
+            dt=float(args.preference_loss_dt),
+        )
+        for key, value in pref_metrics.items():
+            loss_dict[key] = value
+        loss_dict["loss"] = diffusion_base_loss
+        if float(args.preference_aux_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.preference_aux_loss_weight) * loss_dict["preference_proxy_loss"]
+        if float(args.temporal_near_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_near_loss_weight) * loss_dict["temporal_near_condition_loss"]
+        if float(args.temporal_gate_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_gate_loss_weight) * loss_dict["temporal_far_condition_loss"]
+        if float(args.temporal_gate_target_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_gate_target_loss_weight) * (
+                loss_dict["temporal_near_gate_target_loss"] + loss_dict["temporal_far_gate_target_loss"]
+            )
+        if float(args.temporal_gate_order_loss_weight) > 0.0:
+            loss_dict["loss"] = loss_dict["loss"] + float(args.temporal_gate_order_loss_weight) * loss_dict["temporal_gate_order_loss"]
         log_item = {
             key: float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
             for key, value in loss_dict.items()

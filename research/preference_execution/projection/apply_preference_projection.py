@@ -39,7 +39,14 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--record_scope", type=str, default="split_valid", choices=["split_valid", "memory_eligible"])
     parser.add_argument("--target_style_mode", type=str, default="self", choices=["self", "fixed"])
+    parser.add_argument(
+        "--target_intensity_mode",
+        type=str,
+        default="observed",
+        choices=["prototype", "observed", "fixed"],
+    )
     parser.add_argument("--fixed_style_label", type=str, default="aggressive", choices=["aggressive", "normal", "conservative"])
+    parser.add_argument("--fixed_style_intensity", type=float, default=1.0)
     parser.add_argument("--min_bucket_size", type=int, default=128)
     parser.add_argument("--log_interval", type=int, default=5000)
     return parser.parse_args()
@@ -58,7 +65,9 @@ def main() -> None:
         output_summary_path=projection_summary_path(output_dir),
         record_scope=args.record_scope,
         target_style_mode=args.target_style_mode,
+        target_intensity_mode=args.target_intensity_mode,
         fixed_style_label=args.fixed_style_label,
+        fixed_style_intensity=args.fixed_style_intensity,
         min_bucket_size=args.min_bucket_size,
         log_interval=args.log_interval,
     )

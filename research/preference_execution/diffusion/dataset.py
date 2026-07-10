@@ -71,7 +71,12 @@ class PreferenceConditionedPlannerData(Dataset):
                         "filename": str(raw.get("filename", "")),
                         "scene_bucket": str(raw.get("scene_bucket", "none")),
                         "style_label": str(raw.get("style_label", "unknown")),
+                        "observed_style_label": str(raw.get("observed_style_label", "unknown")),
                         "target_style_label": str(raw.get("target_style_label", "unknown")),
+                        "observed_intensity_alpha": float(raw.get("observed_intensity_alpha", 0.0)),
+                        "observed_intensity_beta": float(raw.get("observed_intensity_beta", 0.0)),
+                        "target_intensity_alpha": float(raw.get("target_intensity_alpha", 0.0)),
+                        "target_intensity_beta": float(raw.get("target_intensity_beta", 0.0)),
                         "style_value_condition": style_vec,
                         "scene_gate_values": [float(value) for value in raw.get("scene_gate_values", [])],
                         "axis_gate_values": [float(value) for value in raw.get("axis_gate_values", [])],
@@ -84,6 +89,15 @@ class PreferenceConditionedPlannerData(Dataset):
                         ],
                         "effective_preference_scene_vec": [
                             float(value) for value in raw.get("effective_preference_scene_vec", [])
+                        ],
+                        "target_preference_global_vec": [
+                            float(value) for value in raw.get("target_preference_global_vec", [])
+                        ],
+                        "safe_preference_global_vec": [
+                            float(value) for value in raw.get("safe_preference_global_vec", [])
+                        ],
+                        "effective_preference_global_vec": [
+                            float(value) for value in raw.get("effective_preference_global_vec", [])
                         ],
                     }
                 )
@@ -106,6 +120,7 @@ class PreferenceConditionedPlannerData(Dataset):
             "filename": filename,
             "scene_bucket": str(record["scene_bucket"]),
             "style_label": str(record["style_label"]),
+            "observed_style_label": str(record["observed_style_label"]),
             "target_style_label": str(record["target_style_label"]),
             "ego_current_state": _tensor_from_array(npz_data["ego_current_state"]),
             "ego_future_gt": _tensor_from_array(npz_data["ego_agent_future"]),
@@ -125,6 +140,10 @@ class PreferenceConditionedPlannerData(Dataset):
             "route_lanes_mask": _tensor_from_array(npz_data["route_lanes_mask"], dtype=torch.bool),
             "style_value_condition": torch.as_tensor(style_value_condition, dtype=torch.float32),
             "style_feature_valid": torch.as_tensor(style_feature_valid, dtype=torch.bool),
+            "observed_intensity_alpha": torch.as_tensor(record["observed_intensity_alpha"], dtype=torch.float32),
+            "observed_intensity_beta": torch.as_tensor(record["observed_intensity_beta"], dtype=torch.float32),
+            "target_intensity_alpha": torch.as_tensor(record["target_intensity_alpha"], dtype=torch.float32),
+            "target_intensity_beta": torch.as_tensor(record["target_intensity_beta"], dtype=torch.float32),
             "scene_gate_values": torch.as_tensor(record["scene_gate_values"], dtype=torch.float32),
             "axis_gate_values": torch.as_tensor(record["axis_gate_values"], dtype=torch.float32),
             "local_axis_gate_values": torch.as_tensor(record["local_axis_gate_values"], dtype=torch.float32),
@@ -140,6 +159,17 @@ class PreferenceConditionedPlannerData(Dataset):
                 record["effective_preference_scene_vec"],
                 dtype=torch.float32,
             ),
+            "target_preference_global_vec": torch.as_tensor(
+                record["target_preference_global_vec"],
+                dtype=torch.float32,
+            ),
+            "safe_preference_global_vec": torch.as_tensor(
+                record["safe_preference_global_vec"],
+                dtype=torch.float32,
+            ),
+            "effective_preference_global_vec": torch.as_tensor(
+                record["effective_preference_global_vec"],
+                dtype=torch.float32,
+            ),
         }
         return sample
-

@@ -135,6 +135,9 @@ class WandbLogger:
         if self.writer is not None:
             self.writer.close()
 
+        if not self.use_online or self.online_backend == "disabled":
+            return
+
         if self.online_backend == "wandb" and self.wandb_writer is not None:
             self.wandb_writer.finish()
             return

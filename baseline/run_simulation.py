@@ -36,9 +36,10 @@ SAVE_ROOT = NUPLAN_EXP_ROOT
 # ==============================================================================
 # 可选：
 # - diffusion_planner
+# - style_planner
 # - wayformer
 PLANNER = "diffusion_planner"
-SUPPORTED_PLANNERS_FALLBACK = ["diffusion_planner", "wayformer"]
+SUPPORTED_PLANNERS_FALLBACK = ["diffusion_planner", "style_planner", "wayformer"]
 
 # 在线日志后端（默认 swanlab）
 # - swanlab: 优先 swanlab，抑制 wandb 自动初始化
@@ -52,6 +53,15 @@ ONLINE_LOGGER = "swanlab"
 CHECKPOINT_DIR = "/mnt/mydata/lishangwen/NuplanBaselinesRecord/nuplan_baseline/train_log/diffusion-planner/2026_02_02-13_05_43"
 ARGS_FILE = os.path.join(CHECKPOINT_DIR, "args.json")
 CKPT_FILE = os.path.join(CHECKPOINT_DIR, "best_model-epoch_60-train_loss_0.0947.pth")
+
+# ==============================================================================
+# style_planner runtime preference command（仅在 PLANNER="style_planner" 时生效）
+# ==============================================================================
+RUNTIME_PREFERENCE_ENABLED = True
+RUNTIME_STYLE_LABEL = "normal"
+RUNTIME_STYLE_INTENSITY = 0.0
+RUNTIME_TRACE_EXPORT_ENABLED = True
+RUNTIME_PROJECTION_STATS_PATH = ""
 
 # ==============================================================================
 # 仿真参数
@@ -147,6 +157,31 @@ def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str, int]:
         _planner_override(PLANNER, "config.render_save_dir", video_output_dir),
         _planner_override(PLANNER, "config.raw_data_save_dir", raw_output_dir),
     ]
+    if PLANNER == "style_planner":
+        planner_overrides.extend(
+            [
+                _planner_override(
+                    PLANNER,
+                    "config.runtime_preference_enabled",
+                    str(bool(RUNTIME_PREFERENCE_ENABLED)).lower(),
+                ),
+                _planner_override(PLANNER, "config.runtime_style_label", RUNTIME_STYLE_LABEL),
+                _planner_override(PLANNER, "config.runtime_style_intensity", str(float(RUNTIME_STYLE_INTENSITY))),
+                _planner_override(
+                    PLANNER,
+                    "config.runtime_trace_export_enabled",
+                    str(bool(RUNTIME_TRACE_EXPORT_ENABLED)).lower(),
+                ),
+            ]
+        )
+        if str(RUNTIME_PROJECTION_STATS_PATH).strip():
+            planner_overrides.append(
+                _planner_override(
+                    PLANNER,
+                    "config.runtime_projection_stats_path",
+                    str(RUNTIME_PROJECTION_STATS_PATH),
+                )
+            )
     scenario_filter_overrides: List[str] = []
     mini_test_count = 0
     if SPLIT == "mini":
