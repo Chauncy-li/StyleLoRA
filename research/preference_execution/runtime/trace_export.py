@@ -14,7 +14,7 @@ CONTROLLED_RUNTIME_SCENES: tuple[str, ...] = (
     "straight_free_drive",
     "straight_car_follow",
 )
-ENERGY_SUPPORT_REASON_NAMES = {
+AXIS_REFERENCE_SUPPORT_REASON_NAMES = {
     0: "enabled",
     1: "scene_or_axis_inactive",
     2: "missing_required_raw_input",
@@ -24,7 +24,7 @@ ENERGY_SUPPORT_REASON_NAMES = {
     6: "free_drive_not_clear",
     7: "no_valid_reference_axis",
 }
-ENERGY_SPEED_LIMIT_SOURCE_NAMES = {
+AXIS_REFERENCE_SPEED_LIMIT_SOURCE_NAMES = {
     0: "none",
     1: "route_lane",
     2: "lane_fallback",
@@ -206,24 +206,24 @@ def build_runtime_trace_row(
         and style_condition_enabled
         and any(causal_axis_mask)
     )
-    energy_support_reason_code = _first_int(
-        debug.get("preference_energy_support_reason_code", 1),
+    axis_reference_support_reason_code = _first_int(
+        debug.get("preference_axis_reference_support_reason_code", 1),
         default=1,
     )
     speed_limit_source_code = _first_int(
-        debug.get("preference_energy_speed_limit_source_code", 0),
+        debug.get("preference_axis_reference_speed_limit_source_code", 0),
     )
-    energy_reference_valid = [
+    axis_reference_valid = [
         bool(value)
         for value in list(
             debug.get(
-                "preference_energy_reference_valid_axis_mask",
+                "preference_axis_reference_valid_axis_mask",
                 [False] * len(scene_axis_names),
             )
         )[: len(scene_axis_names)]
     ]
-    while len(energy_reference_valid) < len(scene_axis_names):
-        energy_reference_valid.append(False)
+    while len(axis_reference_valid) < len(scene_axis_names):
+        axis_reference_valid.append(False)
 
     return {
         "step_index": int(step_index),
@@ -288,24 +288,11 @@ def build_runtime_trace_row(
             "cfg_guidance_scale": float(
                 debug.get("cfg_guidance_scale", 1.0)
             ),
-            "preference_energy_guidance_scale_requested": float(
-                debug.get("preference_energy_guidance_scale_requested", 0.0)
-            ),
             "normal_anchor_cfg_used": _first_bool(
                 debug.get("normal_anchor_cfg_used", False)
             ),
             "empty_cfg_reference_used": _first_bool(
                 debug.get("empty_cfg_reference_used", False)
-            ),
-            "preference_energy_guidance_used": _first_bool(
-                debug.get("preference_energy_guidance_used", False)
-            ),
-            "preference_energy": float(debug.get("preference_energy", 0.0)),
-            "preference_axis_energy": float(
-                debug.get("preference_axis_energy", 0.0)
-            ),
-            "preference_safety_energy": float(
-                debug.get("preference_safety_energy", 0.0)
             ),
             "generated_axis_percentile_vec": generated_axis_percentile,
             "generated_axis_valid_mask": generated_axis_valid,
@@ -321,48 +308,48 @@ def build_runtime_trace_row(
                 axis_name: bool(generated_axis_valid[index])
                 for index, axis_name in enumerate(scene_axis_names)
             },
-            "energy_support": {
-                "reason_code": energy_support_reason_code,
-                "reason": ENERGY_SUPPORT_REASON_NAMES.get(
-                    energy_support_reason_code,
+            "axis_reference_support": {
+                "reason_code": axis_reference_support_reason_code,
+                "reason": AXIS_REFERENCE_SUPPORT_REASON_NAMES.get(
+                    axis_reference_support_reason_code,
                     "unknown",
                 ),
                 "shared_condition_count": _first_int(
                     debug.get(
-                        "preference_energy_shared_condition_count",
+                        "preference_axis_reference_shared_condition_count",
                         0,
                     )
                 ),
                 "speed_limit_source_code": speed_limit_source_code,
-                "speed_limit_source": ENERGY_SPEED_LIMIT_SOURCE_NAMES.get(
+                "speed_limit_source": AXIS_REFERENCE_SPEED_LIMIT_SOURCE_NAMES.get(
                     speed_limit_source_code,
                     "unknown",
                 ),
                 "speed_limit_valid": _first_bool(
                     debug.get(
-                        "preference_energy_speed_limit_valid",
+                        "preference_axis_reference_speed_limit_valid",
                         False,
                     )
                 ),
                 "route_curvature_valid": _first_bool(
                     debug.get(
-                        "preference_energy_route_curvature_valid",
+                        "preference_axis_reference_route_curvature_valid",
                         False,
                     )
                 ),
                 "free_drive_clear": _first_bool(
                     debug.get(
-                        "preference_energy_free_drive_clear",
+                        "preference_axis_reference_free_drive_clear",
                         False,
                     )
                 ),
                 "active_traffic_control": _first_bool(
                     debug.get(
-                        "preference_energy_active_traffic_control",
+                        "preference_axis_reference_active_traffic_control",
                         False,
                     )
                 ),
-                "reference_valid_axis_mask": energy_reference_valid,
+                "reference_valid_axis_mask": axis_reference_valid,
             },
         },
     }

@@ -136,8 +136,7 @@ anchor_cfg: empty CFG reference never used
 ```
 
 Only after scale 1.0 passes exactly should scales 1.1 and 1.2 be compared for
-raw-axis strength, calibration, jerk, collision, and preservation. Energy
-guidance remains zero throughout Stage B.
+raw-axis strength, calibration, jerk, collision, and preservation.
 
 After the unit-scale contract has passed, both effect scales can be evaluated
 in one paired invocation:
@@ -174,7 +173,7 @@ the final applicability decision is the same causal runtime Router used by the
 planner. Build the closed-loop cohort in two stages:
 
 1. Run exactly one frozen `router_only`, `rho=0` discovery job. This keeps
-   selection independent of CFG, rho treatment, and energy guidance.
+   selection independent of CFG and rho treatment.
 2. In the initial Router audit window, require enough controlled active steps
    and a stable dominant `straight_free_drive` or `straight_car_follow` gate.
 3. Export a balanced exact `scenario_tokens` JSON cohort.
@@ -189,36 +188,7 @@ The closed-loop launcher supports this protocol through
 It also overrides a debug scenario-filter limit to the exact token count, so a
 fixed cohort cannot be silently truncated by `boston.yaml`.
 
-### Preference and safety energy (Stage C)
-
-The legacy conditional-percentile energy remains available for reproducing V1,
-but it is disabled by the new preset. Stage C should use the non-saturating raw
-axis target and separate the preference objective from a rho-independent safety
-barrier; it is not part of the current router-only training run.
-
-Before changing the Energy objective, run the isolated closed-loop integration
-gate on the selected A3.8 checkpoint.  Keep CFG fixed at the Stage-B operating
-point (`1.1`) and compare `anchor_cfg` with `full_energy` on the exact frozen
-Router-token cohort, seed, and rho grid.  This gate validates the existing
-frozen-reference Energy execution path; it is not a new training preset and
-does not by itself promote the legacy objective to the final paper method.
-
-`run_styleplanner_v6_closed_loop_suite.py
---require-stage-c-energy-contract` enforces:
-
-```text
-variants == anchor_cfg,full_energy
-CFG scale == 1.1
-rho grid contains negative, zero, and positive commands
-the frozen normalization/rank JSON files exist and their SHA256 hashes are recorded
-Energy never executes outside a controlled Router-active row
-full_energy at nonzero rho executes Energy in both required controlled scenes
-full_energy at rho=0 uses no Energy gradient
-all Energy scalars are finite and final-axis diagnostics are available
-```
-
-The Stage-B invocation remains backward-compatible: without `full_energy`, the
-Energy scale must still be exactly zero.  Each closed-loop job now also writes
+Each closed-loop job writes
 `v6_closed_loop_metrics.json` and `v6_closed_loop_scenario_metrics.csv` so
 activation, safety, progress, and style effects can be inspected separately.
 
@@ -312,7 +282,7 @@ v6_signed_router_ncqt_stage_a3_6_worst_axis
 Stage A3.6 branches directly from A3.4, not A3.5. It preserves the global-rho
 command, self-generated acceleration-opportunity support, terminal interval,
 NCQT and symmetry weights, frozen planner, signed Router, kinematic ego
-residual, data path, CFG-off state, energy-off state, and inference behavior.
+residual, data path, CFG-off state, and inference behavior.
 Only the monotonic hinge aggregation changes.
 
 The legacy `axis_mean` mode still samples eligible `(sample, axis)` rows and is
@@ -371,7 +341,7 @@ call that shaped residual is executed.
 The global-rho paired monotonic objective is sampled in `[0.001, 0.0011]`, the
 same active execution window. The six-axis definitions/data, signed Router and
 scene gates, one global rho, bias-free heads, ego-only scope, NCQT/soft-worst
-weights, frozen planner, CFG-off state, and energy-off state are unchanged.
+weights, frozen planner, CFG-off state, and inference behavior are unchanged.
 Car-follow rows retain the historical all-step A3.7 kinematic path. Therefore
 rho=0 and empty conditions remain exact zero-residual cases.
 
@@ -430,7 +400,7 @@ v6_signed_router_ncqt_stage_a3_7_axis_temporal
 Stage A3.7 is an independent structural branch from A3.6. It keeps the same
 global-rho command, sample-grouped soft-worst monotonic loss, NCQT and symmetry
 weights, self-generated acceleration support, terminal interval, frozen
-planner, Router gates, 12-D data contract, CFG-off state, and energy-off state.
+planner, Router gates, 12-D data contract, CFG-off state, and inference behavior.
 Only the ego kinematic residual changes.
 
 The signed Router still produces its historical summed residual and now also
@@ -517,7 +487,7 @@ It enables:
 - exogenous-neighbor leakage diagnostics;
 - same-noise monotonic and physical odd-symmetry losses;
 - controlled/preservation 70/30 batch sampling;
-- CFG and sampling-time energy disabled;
+- CFG disabled during training and the standard diffusion sampler unchanged;
 - worst-scene signed-control checkpoint selection.
 
 ### Reverting without source rollback

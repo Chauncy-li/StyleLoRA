@@ -134,7 +134,7 @@ python -m research.continuous_style.evaluate_continuous_style_v6_rho_sweep --hel
 ## Modules that must remain aligned
 
 - `metrics.py`: hard, interpretable behavior measurements.
-- `soft_metrics.py`: differentiable surrogates for future preference-energy guidance.
+- `soft_metrics.py`: differentiable surrogates for preference-axis objectives.
 - `router.py`: causal car-follow/free-drive applicability signals.
 - `runtime.py`: online scalar-rho to V6 condition adapter.
 - `v5.py`: retained data measurement and calibration implementation.

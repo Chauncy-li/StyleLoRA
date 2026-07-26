@@ -1,4 +1,4 @@
-"""Losses specific to V6 axis routing, normal anchoring, and energy alignment."""
+"""Losses specific to V6 axis routing and normal anchoring."""
 
 from __future__ import annotations
 
@@ -236,26 +236,6 @@ def decoder_reported_v6_losses(
         "axis_router_activity_loss": activity_loss,
         "axis_router_gate_mean": gate_mean,
         "axis_router_active_fraction": active_fraction,
-        "conditional_preference_energy_loss": decoder_output.get(
-            "preference_energy",
-            zero,
-        ),
-        "conditional_preference_axis_energy": decoder_output.get(
-            "preference_axis_energy",
-            zero,
-        ),
-        "conditional_preference_safety_energy": decoder_output.get(
-            "preference_safety_energy",
-            zero,
-        ),
-        "conditional_preference_axis_error": decoder_output.get(
-            "preference_axis_error",
-            zero,
-        ),
-        "conditional_preference_energy_active_ratio": decoder_output.get(
-            "preference_energy_active_ratio",
-            zero,
-        ),
     }
     free_used = decoder_output.get("axis_temporal_free_drive_used")
     coefficient_l2 = decoder_output.get("axis_temporal_coefficient_l2")
@@ -337,7 +317,6 @@ def compute_normal_reference_prediction(
         "sampled_trajectories": sampled,
         "diffusion_time": diffusion_time,
         "style_value_condition": normal_condition,
-        "disable_preference_energy": True,
     }
     planner = _planner_module(model)
     with torch.no_grad():
@@ -891,7 +870,6 @@ def compute_signed_pair_monotonic_loss(
     normal_pair_inputs.update(
         {
             "style_value_condition": base_condition,
-            "disable_preference_energy": True,
         }
     )
     normal_encoder = {"encoding": context_encoding[sample_indices]}
@@ -932,7 +910,6 @@ def compute_signed_pair_monotonic_loss(
                     "sampled_trajectories": paired_sampled,
                     "diffusion_time": paired_diffusion_time,
                     "style_value_condition": paired_condition,
-                    "disable_preference_energy": True,
                 }
             )
             normal_pair_inputs.update(
@@ -1004,7 +981,6 @@ def compute_signed_pair_monotonic_loss(
             "sampled_trajectories": paired_sampled,
             "diffusion_time": paired_diffusion_time,
             "style_value_condition": paired_condition,
-            "disable_preference_energy": True,
         }
     )
     if terminal_pair_enabled:
@@ -1312,7 +1288,6 @@ def compute_normal_anchor_consistency_loss(
         "sampled_trajectories": torch.cat([active_sampled] * 2, dim=0),
         "diffusion_time": torch.cat([active_diffusion_time] * 2, dim=0),
         "style_value_condition": paired_condition,
-        "disable_preference_energy": True,
     }
     phase_time_mask = inputs.get("phase_time_mask")
     if torch.is_tensor(phase_time_mask):

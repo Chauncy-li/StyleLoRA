@@ -34,7 +34,10 @@ class _IdentityStateNormalizer:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Check V6 axis router, normal-anchor semantics, and frozen energy references."
+        description=(
+            "Check V6 axis router, normal-anchor semantics, and frozen "
+            "conditional-axis references."
+        )
     )
     parser.add_argument("--normalization-path", required=True)
     parser.add_argument("--conditional-rank-model-path", required=True)
@@ -75,7 +78,7 @@ def main() -> None:
     ).style_value_condition()
     empty = np.zeros_like(normal)
 
-    energy = ConditionalPreferenceEnergy(
+    axis_objective = ConditionalPreferenceEnergy(
         normalization_path=args.normalization_path,
         conditional_rank_model_path=args.conditional_rank_model_path,
         state_normalizer=_IdentityStateNormalizer(),
@@ -102,8 +105,8 @@ def main() -> None:
                 and np.all(normal[:3] < aggressive[:3])
             ),
         },
-        "energy_references": energy.reference_summary(),
-        "energy_reference_queries": energy.reference_query_selftest(),
+        "axis_references": axis_objective.reference_summary(),
+        "axis_reference_queries": axis_objective.reference_query_selftest(),
     }
     report["pass"] = bool(
         all(bool(value) for value in signed_router.values())
@@ -118,12 +121,12 @@ def main() -> None:
         and report["condition_contract"]["ordered_targets"]
         and all(
             int(item["reference_count"]) > 0
-            for item in report["energy_references"].values()
+            for item in report["axis_references"].values()
         )
         and all(
             all(bool(value) for value in item["valid_axes"])
             and all(abs(float(value) - 1.0) < 1e-4 for value in item["weight_sums"])
-            for item in report["energy_reference_queries"].values()
+            for item in report["axis_reference_queries"].values()
         )
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))

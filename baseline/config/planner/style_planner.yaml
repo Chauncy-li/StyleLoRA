@@ -30,9 +30,6 @@ style_planner:
     # Router-only rollback is exactly: enabled=false, scale=1.0.
     normal_anchor_cfg_enabled: false
     cfg_guidance_scale: 1.0
-    # Energy is intentionally kept outside the selected Stage-B experiment.
-    preference_energy_enabled: false
-    preference_energy_guidance_scale: 0.0
     runtime_v6_min_router_confidence: 0.60
     runtime_route_lane_change_intent: false
     runtime_route_lane_change_intent_available: false

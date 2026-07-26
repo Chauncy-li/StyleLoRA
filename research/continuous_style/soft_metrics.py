@@ -1,4 +1,4 @@
-"""Differentiable soft metric surrogates for future style-energy guidance."""
+"""Differentiable soft metric surrogates for preference-axis objectives."""
 
 from __future__ import annotations
 

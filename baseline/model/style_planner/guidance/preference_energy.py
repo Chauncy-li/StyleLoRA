@@ -1,4 +1,4 @@
-"""Differentiable, condition-calibrated preference energy for StylePlanner."""
+"""Condition-calibrated behavior-axis objectives for StylePlanner."""
 
 from __future__ import annotations
 
@@ -41,18 +41,6 @@ EXPECTED_CONDITION_NAMES = {
         "initial_lead_long_accel_mps2",
     ),
 }
-ENERGY_SUPPORT_REASON_NAMES = {
-    0: "enabled",
-    1: "scene_or_axis_inactive",
-    2: "missing_required_raw_input",
-    3: "insufficient_shared_condition_features",
-    4: "frozen_reference_unavailable",
-    5: "active_traffic_control",
-    6: "free_drive_not_clear",
-    7: "no_valid_reference_axis",
-}
-
-
 def _empty_support_diagnostics(
     *,
     batch_size: int,
@@ -186,12 +174,12 @@ def _first_event_value(
 
 
 class ConditionalPreferenceEnergy:
-    """Use frozen train references to guide generated trajectories in percentile space.
+    """Provide frozen conditional references and differentiable behavior axes.
 
-    The energy is active only for V6 car-follow/free-drive conditions. Preference
-    gradients vanish at the semantic normal command and are attenuated when a
-    generated trajectory approaches collision, overspeed, or kinematic-risk
-    regions. Safety barriers have a higher weight than the preference term.
+    The historical class name is retained because current training/evaluation
+    scripts import it directly. Sampling-time energy guidance has been removed;
+    this object now serves only NCQT, signed-axis losses, and read-only generated
+    trajectory diagnostics.
     """
 
     def __init__(
@@ -203,14 +191,12 @@ class ConditionalPreferenceEnergy:
         neighbours: int = 64,
         min_shared_condition_features: int = 3,
         cdf_temperature: float = 0.04,
-        preference_weight: float = 1.0,
-        safety_weight: float = 4.0,
         free_drive_accel_support_mode: str = "self_generated",
         dt: float = 0.1,
     ) -> None:
         if not normalization_path or not conditional_rank_model_path:
             raise ValueError(
-                "Preference energy requires train v5_normalization.json and "
+                "Conditional axis objective requires train v5_normalization.json and "
                 "v5_conditional_rank_model.json paths"
             )
         self.normalization_path = str(normalization_path)
@@ -219,8 +205,6 @@ class ConditionalPreferenceEnergy:
         self.neighbours = max(int(neighbours), 1)
         self.min_shared_condition_features = max(int(min_shared_condition_features), 1)
         self.cdf_temperature = max(float(cdf_temperature), 1e-3)
-        self.preference_weight = max(float(preference_weight), 0.0)
-        self.safety_weight = max(float(safety_weight), 0.0)
         self.free_drive_accel_support_mode = str(
             free_drive_accel_support_mode
         )
@@ -247,7 +231,7 @@ class ConditionalPreferenceEnergy:
             )
         if str(normalization.get("fit_split", "")) != "train_only_input":
             raise ValueError(
-                "Preference energy requires a train-only V5 normalization "
+                "Conditional axis objective requires a train-only V5 normalization "
                 f"artifact, got fit_split={normalization.get('fit_split')!r}"
             )
         if str(rank_model.get("artifact", "")) != "conditional_rank_model":
@@ -257,7 +241,7 @@ class ConditionalPreferenceEnergy:
             )
         if str(rank_model.get("fit_split", "")) != "train_only_oof":
             raise ValueError(
-                "Preference energy requires a train-only V5 conditional-rank "
+                "Conditional axis objective requires a train-only V5 conditional-rank "
                 f"artifact, got fit_split={rank_model.get('fit_split')!r}"
             )
         self.min_effective_neighbours = max(
@@ -643,8 +627,8 @@ class ConditionalPreferenceEnergy:
         except ImportError:
             if eligible_indices.size > 30000:
                 raise RuntimeError(
-                    "scikit-learn is required for differentiable preference "
-                    "energy with more than 30k conditional references"
+                    "scikit-learn is required for differentiable conditional-axis "
+                    "objectives with more than 30k reference rows"
                 )
 
         payload: Dict[str, Any] = {
@@ -663,23 +647,23 @@ class ConditionalPreferenceEnergy:
         prepared: Mapping[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         key_map = {
-            "support_reason_code": "preference_energy_support_reason_code",
+            "support_reason_code": "preference_axis_reference_support_reason_code",
             "shared_condition_count": (
-                "preference_energy_shared_condition_count"
+                "preference_axis_reference_shared_condition_count"
             ),
             "speed_limit_source_code": (
-                "preference_energy_speed_limit_source_code"
+                "preference_axis_reference_speed_limit_source_code"
             ),
-            "speed_limit_valid": "preference_energy_speed_limit_valid",
+            "speed_limit_valid": "preference_axis_reference_speed_limit_valid",
             "route_curvature_valid": (
-                "preference_energy_route_curvature_valid"
+                "preference_axis_reference_route_curvature_valid"
             ),
-            "free_drive_clear": "preference_energy_free_drive_clear",
+            "free_drive_clear": "preference_axis_reference_free_drive_clear",
             "active_traffic_control": (
-                "preference_energy_active_traffic_control"
+                "preference_axis_reference_active_traffic_control"
             ),
             "reference_valid_axis_mask": (
-                "preference_energy_reference_valid_axis_mask"
+                "preference_axis_reference_valid_axis_mask"
             ),
         }
         diagnostics: Dict[str, torch.Tensor] = {}
@@ -904,8 +888,8 @@ class ConditionalPreferenceEnergy:
                 query_valid,
             )
             # The frozen free-drive labels explicitly excluded traffic-control
-            # influenced frames. Do not extrapolate their speed preference
-            # energy through a currently yellow/red route segment.
+            # influenced frames. Do not extrapolate their speed-preference
+            # reference through a currently yellow/red route segment.
             if scene == "straight_free_drive":
                 active_traffic_control[batch_index] = (
                     self._route_has_active_control(
@@ -1145,59 +1129,6 @@ class ConditionalPreferenceEnergy:
         )
         return values, confidence
 
-    def _safety_energy(
-        self,
-        *,
-        ego_future: torch.Tensor,
-        neighbor_future: torch.Tensor,
-        neighbor_valid: torch.Tensor,
-        speed_limit: torch.Tensor,
-        speed_limit_valid: bool,
-    ) -> torch.Tensor:
-        speed = _speed_from_xy(ego_future[:, :2], self.dt)
-        acceleration = _finite_difference(speed, self.dt)
-        jerk = _finite_difference(acceleration, self.dt)
-
-        overspeed = (
-            F.softplus((speed - 1.05 * speed_limit.clamp_min(1.0)) / 0.5).square().mean()
-            if speed.numel() and speed_limit_valid
-            else ego_future.new_zeros(())
-        )
-        accel_risk = (
-            (
-                F.softplus((acceleration - 4.0) / 0.5).square()
-                + F.softplus((-6.0 - acceleration) / 0.5).square()
-            ).mean()
-            if acceleration.numel()
-            else ego_future.new_zeros(())
-        )
-        jerk_risk = (
-            F.softplus((jerk.abs() - 8.0) / 1.0).square().mean()
-            if jerk.numel()
-            else ego_future.new_zeros(())
-        )
-
-        collision_risk = ego_future.new_zeros(())
-        if neighbor_future.numel() and bool(neighbor_valid.any()):
-            valid_neighbor_future = neighbor_future[neighbor_valid].detach()
-            relative = ego_future[None, :, :2] - valid_neighbor_future[:, :, :2]
-            # Conservative ellipse approximates vehicle footprint plus margin:
-            # roughly 5 m longitudinal and 2.2 m lateral center separation.
-            normalized_clearance = torch.sqrt(
-                (relative[..., 0] / 5.0).square()
-                + (relative[..., 1] / 2.2).square()
-                + 1e-6
-            )
-            clearance_barrier = F.softplus(
-                (1.0 - normalized_clearance) / 0.12
-            ).square()
-            flat_barrier = clearance_barrier.reshape(-1)
-            collision_risk = (
-                torch.logsumexp(6.0 * flat_barrier, dim=0)
-                - math.log(max(int(flat_barrier.numel()), 1))
-            ) / 6.0
-        return collision_risk + 0.35 * overspeed + 0.15 * accel_risk + 0.05 * jerk_risk
-
     @staticmethod
     def _inverse_weighted_reference_cdf(
         values: torch.Tensor,
@@ -1240,7 +1171,7 @@ class ConditionalPreferenceEnergy:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return unclamped canonical raw axes, confidence, and physical axes.
 
-        Unlike the percentile-energy path, the generated coordinates are not
+        Unlike bounded percentile diagnostics, the generated coordinates are not
         clamped and do not pass through a sigmoid CDF.  Gradients therefore
         remain available when a predicted trajectory lies outside the train
         reference support.
@@ -1600,7 +1531,7 @@ class ConditionalPreferenceEnergy:
             "normal_relative_anchor_raw_axis": normal_raw.detach(),
         }
 
-    def energy_terms(
+    def axis_diagnostic_terms(
         self,
         model_output: torch.Tensor,
         inputs: Mapping[str, Any],
@@ -1609,10 +1540,15 @@ class ConditionalPreferenceEnergy:
         if model_output.ndim == 3:
             batch_size, agent_count, flat_dim = model_output.shape
             if flat_dim % 4 != 0:
-                raise ValueError("Preference energy expects flattened xy-cos-sin trajectories")
+                raise ValueError(
+                    "Axis diagnostics expect flattened xy-cos-sin trajectories"
+                )
             model_output = model_output.reshape(batch_size, agent_count, -1, 4)
         if model_output.ndim != 4:
-            raise ValueError(f"Preference energy expects [B,P,T,4], got {tuple(model_output.shape)}")
+            raise ValueError(
+                "Axis diagnostics expect [B,P,T,4], got "
+                f"{tuple(model_output.shape)}"
+            )
 
         enabled = prepared["enabled"].bool()
         batch_size = model_output.shape[0]
@@ -1632,15 +1568,11 @@ class ConditionalPreferenceEnergy:
         )
         support_debug = self._support_debug_from_prepared(prepared)
         if not bool(enabled.any()):
-            terms = {
-                "preference_energy": zero,
-                "preference_safety_energy": zero,
-                "preference_command_strength": zero,
-                "preference_energy_active_ratio": enabled.float().mean(),
-            }
-            self._last_diagnostics = {
-                **{key: value.detach() for key, value in terms.items()},
+            diagnostics = {
                 **support_debug,
+                "preference_command_strength": zero,
+                "preference_axis_error": zero,
+                "preference_axis_diagnostic_active_ratio": enabled.float().mean(),
                 "preference_generated_axis_percentile": generated_percentile_debug,
                 "preference_generated_raw_axis": generated_raw_axis_debug,
                 "preference_generated_axis_canonical": generated_canonical_axis_debug,
@@ -1650,7 +1582,11 @@ class ConditionalPreferenceEnergy:
                 ),
                 "preference_target_axis_percentile": prepared["target"].detach(),
             }
-            return terms
+            self._last_diagnostics = {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in diagnostics.items()
+            }
+            return diagnostics
 
         future_normalized = model_output[:, :, 1:, :]
         future_physical = self.state_normalizer.inverse(future_normalized)
@@ -1687,17 +1623,11 @@ class ConditionalPreferenceEnergy:
                     "preference_ego_reference_future batch size mismatch"
                 )
             fixed_ego_future = fixed_ego_future.detach()
-        preference_per_sample = []
-        safety_per_sample = []
-        total_per_sample = []
         strength_per_sample = []
         axis_error_values = []
 
         for batch_index in range(batch_size):
             if not bool(enabled[batch_index]):
-                preference_per_sample.append(zero)
-                safety_per_sample.append(zero)
-                total_per_sample.append(zero)
                 strength_per_sample.append(zero)
                 continue
             scene = SCENE_ORDER[int(prepared["scene_index"][batch_index].item())]
@@ -1712,11 +1642,7 @@ class ConditionalPreferenceEnergy:
             neighbor_current = prepared["neighbor_past"][
                 batch_index, :neighbor_count, -1
             ]
-            neighbor_valid = prepared["neighbor_mask"][
-                batch_index, :neighbor_count, -1
-            ].bool()
             speed_limit = prepared["speed_limit_mps"][batch_index].clamp_min(1.0)
-            speed_limit_valid = bool(prepared["speed_limit_valid"][batch_index])
 
             if scene == "straight_free_drive":
                 raw_axis, metric_confidence = self._free_drive_axes(
@@ -1772,52 +1698,22 @@ class ConditionalPreferenceEnergy:
             generated_canonical_axis_debug[batch_index] = canonical_unclamped.detach()
             generated_axis_valid_debug[batch_index] = axis_mask.detach() > 1e-4
             axis_error = F.smooth_l1_loss(percentile, target, reduction="none", beta=0.08)
-            preference = (axis_error * axis_mask).sum() / axis_mask.sum().clamp_min(1.0)
             strength = (
                 ((target - 0.5).abs() / 0.25).clamp(0.0, 1.0) * prepared["axis_mask"][batch_index].float()
             ).sum() / prepared["axis_mask"][batch_index].float().sum().clamp_min(1.0)
-            preference = preference * strength
-
-            safety = self._safety_energy(
-                ego_future=ego_future,
-                neighbor_future=neighbor_future,
-                neighbor_valid=neighbor_valid,
-                speed_limit=speed_limit,
-                speed_limit_valid=speed_limit_valid,
-            )
-            # Preference is smoothly switched off near unsafe trajectories.
-            # The detached gate prevents the preference term from learning to
-            # lower its own weight by increasing risk.
-            safe_preference_gate = torch.exp(-2.0 * safety.detach()).clamp(0.0, 1.0)
-            total = (
-                self.preference_weight * safe_preference_gate * preference
-                + self.safety_weight * strength * safety
-            )
-            preference_per_sample.append(preference)
-            safety_per_sample.append(safety)
-            total_per_sample.append(total)
             strength_per_sample.append(strength)
             axis_error_values.append((axis_error * axis_mask).sum() / axis_mask.sum().clamp_min(1.0))
 
-        preference_tensor = torch.stack(preference_per_sample)
-        safety_tensor = torch.stack(safety_per_sample)
-        total_tensor = torch.stack(total_per_sample)
         strength_tensor = torch.stack(strength_per_sample)
         active_float = enabled.float()
         denominator = active_float.sum().clamp_min(1.0)
-        terms = {
-            "preference_energy": (total_tensor * active_float).sum() / denominator,
-            "preference_axis_energy": (preference_tensor * active_float).sum() / denominator,
-            "preference_safety_energy": (safety_tensor * active_float).sum() / denominator,
+        diagnostics = {
+            **support_debug,
             "preference_command_strength": (strength_tensor * active_float).sum() / denominator,
-            "preference_energy_active_ratio": active_float.mean(),
+            "preference_axis_diagnostic_active_ratio": active_float.mean(),
             "preference_axis_error": (
                 torch.stack(axis_error_values).mean() if axis_error_values else zero
             ),
-        }
-        self._last_diagnostics = {
-            **{key: value.detach() for key, value in terms.items()},
-            **support_debug,
             "preference_generated_axis_percentile": generated_percentile_debug,
             "preference_generated_raw_axis": generated_raw_axis_debug,
             "preference_generated_axis_canonical": generated_canonical_axis_debug,
@@ -1827,26 +1723,11 @@ class ConditionalPreferenceEnergy:
             ),
             "preference_target_axis_percentile": prepared["target"].detach(),
         }
-        return terms
-
-    def energy_from_model_output(
-        self,
-        model_output: torch.Tensor,
-        _t_input: torch.Tensor,
-        _condition: torch.Tensor,
-        *,
-        inputs: Mapping[str, Any],
-        prepared: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor:
-        terms = self.energy_terms(model_output, inputs, prepared)
-        enabled = prepared["enabled"].bool()
-        if not bool(enabled.any()):
-            return model_output.new_zeros((model_output.shape[0],))
-
-        # Recompute per sample only when DPM asks for gradients. Keeping this
-        # scalar expansion explicit makes the model-wrapper API batch-safe.
-        scalar = terms["preference_energy"]
-        return scalar.expand(model_output.shape[0]) / max(model_output.shape[0], 1)
+        self._last_diagnostics = {
+            key: value.detach() if torch.is_tensor(value) else value
+            for key, value in diagnostics.items()
+        }
+        return diagnostics
 
     def pop_last_diagnostics(self) -> Dict[str, torch.Tensor] | None:
         diagnostics = self._last_diagnostics

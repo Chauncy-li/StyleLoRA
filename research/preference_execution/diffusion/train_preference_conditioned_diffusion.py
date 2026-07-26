@@ -79,7 +79,6 @@ EXPERIMENT_PRESET_PHASEWISE_EXEC_V1_CONDITION_ONLY = "phasewise_exec_v1_conditio
 EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS = "two_stage_exec_v1_pref_loss"
 EXPERIMENT_PRESET_SAMPLER_ONLY_MILD = "sampler_only_mild"
 EXPERIMENT_PRESET_EXEC_V2_MILD_SAMPLER = "exec_v2_mild_sampler"
-EXPERIMENT_PRESET_V6_AXIS_ROUTER_ANCHOR_ENERGY = "v6_axis_router_anchor_energy"
 EXPERIMENT_PRESET_V6_SIGNED_ROUTER_STAGE_A = "v6_signed_router_stage_a"
 EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A = (
     "v6_signed_router_ncqt_stage_a"
@@ -120,7 +119,6 @@ EXPERIMENT_PRESET_CHOICES = (
     EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS,
     EXPERIMENT_PRESET_SAMPLER_ONLY_MILD,
     EXPERIMENT_PRESET_EXEC_V2_MILD_SAMPLER,
-    EXPERIMENT_PRESET_V6_AXIS_ROUTER_ANCHOR_ENERGY,
     EXPERIMENT_PRESET_V6_SIGNED_ROUTER_STAGE_A,
     EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A,
     EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A2,
@@ -141,7 +139,6 @@ PRESET_DEFAULT_EXPERIMENT_NAMES = {
     EXPERIMENT_PRESET_TWO_STAGE_EXEC_V1_PREF_LOSS: "effective_preference_global_vec_two_stage_exec_v1_pref_loss",
     EXPERIMENT_PRESET_SAMPLER_ONLY_MILD: "effective_preference_global_vec_sampler_only_mild",
     EXPERIMENT_PRESET_EXEC_V2_MILD_SAMPLER: "effective_preference_global_vec_exec_v2_mild_sampler",
-    EXPERIMENT_PRESET_V6_AXIS_ROUTER_ANCHOR_ENERGY: "continuous_style_v6_axis_router_anchor_energy",
     EXPERIMENT_PRESET_V6_SIGNED_ROUTER_STAGE_A: "continuous_style_v6_signed_router_stage_a",
     EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A: "continuous_style_v6_signed_router_ncqt_stage_a",
     EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A2: "continuous_style_v6_signed_router_ncqt_stage_a2",
@@ -315,19 +312,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "preserves the Stage-A3.2 one-pass objective."
         ),
     )
-    parser.add_argument("--preference_energy_enabled", action="store_true", default=False)
     parser.add_argument("--preference_energy_normalization_path", default="")
     parser.add_argument("--preference_energy_rank_model_path", default="")
     parser.add_argument("--preference_energy_neighbours", type=int, default=64)
     parser.add_argument("--preference_energy_min_shared_features", type=int, default=3)
     parser.add_argument("--preference_energy_cdf_temperature", type=float, default=0.04)
-    parser.add_argument("--preference_energy_preference_weight", type=float, default=1.0)
-    parser.add_argument("--preference_energy_safety_weight", type=float, default=4.0)
-    parser.add_argument("--preference_energy_loss_weight", type=float, default=0.0)
-    parser.add_argument("--preference_energy_guidance_scale", type=float, default=0.15)
-    parser.add_argument("--preference_energy_grad_clip", type=float, default=0.50)
-    parser.add_argument("--preference_energy_t_min", type=float, default=0.01)
-    parser.add_argument("--preference_energy_t_max", type=float, default=0.55)
     parser.add_argument("--two_stage_split_ratio", type=float, default=0.45)
     parser.add_argument("--two_stage_transition_ratio", type=float, default=0.18)
     parser.add_argument("--seed", type=int, default=3407)
@@ -493,42 +482,6 @@ def _apply_experiment_preset(
             "scene_weight_lane_change": 1.0,
             "scene_weight_default": 1.0,
         }
-    elif preset == EXPERIMENT_PRESET_V6_AXIS_ROUTER_ANCHOR_ENERGY:
-        preset_overrides = {
-            "condition_field": "style_value_condition",
-            "base_style_condition_dim": 12,
-            "style_condition_feature_set": "global_only",
-            "style_condition_encoder": "axis_router_v1",
-            "axis_router_token_dim": 64,
-            "axis_router_activity_loss_weight": 0.02,
-            "axis_router_min_active_gate_fraction": 0.10,
-            "normal_anchor_cfg_enabled": True,
-            "normal_anchor_loss_weight": 0.10,
-            "preference_energy_enabled": True,
-            "preference_energy_loss_weight": 0.05,
-            "preference_energy_guidance_scale": 0.15,
-            "preference_energy_preference_weight": 1.0,
-            "preference_energy_safety_weight": 4.0,
-            "preference_energy_grad_clip": 0.50,
-            "preference_energy_t_min": 0.01,
-            "preference_energy_t_max": 0.55,
-            # Let the zero-initialized adapter learn faster than the verified
-            # planner body, reducing rho=0/lane-change drift during fine-tuning.
-            "backbone_lr_scale": 0.25,
-            "style_adapter_lr_scale": 1.0,
-            "balance_scene_buckets": True,
-            "scene_weight_free_drive": 2.5,
-            "scene_weight_car_follow": 1.25,
-            "scene_weight_lane_change": 1.0,
-            "scene_weight_default": 1.0,
-            # The old proxy/temporal losses describe the retired preference
-            # execution representation and stay disabled for V6.
-            "preference_aux_loss_weight": 0.0,
-            "temporal_near_loss_weight": 0.0,
-            "temporal_gate_loss_weight": 0.0,
-            "temporal_gate_target_loss_weight": 0.0,
-            "temporal_gate_order_loss_weight": 0.0,
-        }
     elif preset == EXPERIMENT_PRESET_V6_SIGNED_ROUTER_STAGE_A:
         # Retained verbatim as the absolute-target Stage-A ablation used by the
         # first signed-router smoke experiment.
@@ -543,9 +496,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.50,
@@ -584,9 +534,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             # NCQT learns a conditional quantile displacement around the exact
@@ -631,9 +578,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -674,9 +618,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -718,9 +659,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -752,7 +690,7 @@ def _apply_experiment_preset(
         # Plus/normal/minus share the recovered forward noise, then traverse a
         # short stop-gradient DPM-Solver++ chain. The final terminal response is
         # differentiable, while Router, ego adapter, base loss, NCQT, inference,
-        # CFG, and energy settings remain exactly those of Stage A3.2.
+        # CFG settings remain exactly those of Stage A3.2.
         preset_overrides = {
             "condition_field": "style_value_condition",
             "base_style_condition_dim": 12,
@@ -765,9 +703,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -813,9 +748,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -863,9 +795,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -914,9 +843,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -970,9 +896,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -1026,9 +949,6 @@ def _apply_experiment_preset(
             "axis_router_activity_loss_weight": 0.0,
             "normal_anchor_cfg_enabled": False,
             "normal_anchor_loss_weight": 0.0,
-            "preference_energy_enabled": False,
-            "preference_energy_loss_weight": 0.0,
-            "preference_energy_guidance_scale": 0.0,
             "cfg_dropout_prob": 0.0,
             "cfg_guidance_scale": 1.0,
             "signed_raw_axis_loss_weight": 0.0,
@@ -1160,15 +1080,6 @@ def _build_args() -> argparse.Namespace:
         raise ValueError(
             "Normal-Anchor CFG requires the V6 style_value_condition contract"
         )
-    if args.preference_energy_enabled:
-        if args.diffusion_model_type != "x_start":
-            raise ValueError("Preference energy currently requires --diffusion_model_type x_start")
-        if not args.preference_energy_normalization_path:
-            raise ValueError("--preference_energy_normalization_path is required")
-        if not args.preference_energy_rank_model_path:
-            raise ValueError("--preference_energy_rank_model_path is required")
-        if not 0.0 <= float(args.preference_energy_t_min) < float(args.preference_energy_t_max) <= 1.0:
-            raise ValueError("Preference energy time range must satisfy 0 <= t_min < t_max <= 1")
     signed_objective_enabled = (
         float(args.signed_raw_axis_loss_weight) > 0.0
         or float(args.normal_relative_axis_loss_weight) > 0.0
@@ -1267,7 +1178,6 @@ def _build_args() -> argparse.Namespace:
     if (
         args.experiment_preset
         in {
-            EXPERIMENT_PRESET_V6_AXIS_ROUTER_ANCHOR_ENERGY,
             EXPERIMENT_PRESET_V6_SIGNED_ROUTER_STAGE_A,
             EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A,
             EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A2,
@@ -1487,7 +1397,7 @@ def _build_signed_axis_objective(
     ):
         return None
     # The V5 artifacts are reused only as frozen train-split references for
-    # inverse-CDF raw-axis targets. Stage A does not enable sampling-time energy.
+    # inverse-CDF raw-axis targets.
     return ConditionalPreferenceEnergy(
         normalization_path=str(args.preference_energy_normalization_path),
         conditional_rank_model_path=str(args.preference_energy_rank_model_path),
@@ -1497,8 +1407,6 @@ def _build_signed_axis_objective(
             args.preference_energy_min_shared_features
         ),
         cdf_temperature=float(args.preference_energy_cdf_temperature),
-        preference_weight=0.0,
-        safety_weight=0.0,
         free_drive_accel_support_mode=str(
             args.free_drive_accel_support_mode
         ),
@@ -1887,10 +1795,6 @@ def _train_epoch(
             loss_dict["loss"] = loss_dict["loss"] + float(
                 args.normal_anchor_loss_weight
             ) * loss_dict["normal_anchor_consistency_loss"]
-        if float(args.preference_energy_loss_weight) > 0.0:
-            loss_dict["loss"] = loss_dict["loss"] + float(
-                args.preference_energy_loss_weight
-            ) * loss_dict["conditional_preference_energy_loss"]
         if float(args.signed_raw_axis_loss_weight) > 0.0:
             loss_dict["loss"] = loss_dict["loss"] + float(
                 args.signed_raw_axis_loss_weight
@@ -2004,10 +1908,6 @@ def _validate_epoch(
             loss_dict["loss"] = loss_dict["loss"] + float(
                 args.normal_anchor_loss_weight
             ) * loss_dict["normal_anchor_consistency_loss"]
-        if float(args.preference_energy_loss_weight) > 0.0:
-            loss_dict["loss"] = loss_dict["loss"] + float(
-                args.preference_energy_loss_weight
-            ) * loss_dict["conditional_preference_energy_loss"]
         if float(args.signed_raw_axis_loss_weight) > 0.0:
             loss_dict["loss"] = loss_dict["loss"] + float(
                 args.signed_raw_axis_loss_weight
@@ -2169,20 +2069,27 @@ def _log_runtime_imports() -> None:
     decoder_path = inspect.getsourcefile(Decoder) or "unknown"
     loss_path = inspect.getsourcefile(diffusion_loss_func) or "unknown"
     v6_loss_path = inspect.getsourcefile(compute_signed_pair_monotonic_loss) or "unknown"
-    energy_path = inspect.getsourcefile(ConditionalPreferenceEnergy) or "unknown"
+    axis_objective_path = (
+        inspect.getsourcefile(ConditionalPreferenceEnergy) or "unknown"
+    )
     print(f"[PrefCondDiffusion] planner_module={planner_path}")
     print(f"[PrefCondDiffusion] decoder_module={decoder_path}")
     print(f"[PrefCondDiffusion] diffusion_loss_module={loss_path}")
     print(f"[PrefCondDiffusion] v6_loss_module={v6_loss_path}")
-    print(f"[PrefCondDiffusion] preference_energy_module={energy_path}")
+    print(f"[PrefCondDiffusion] conditional_axis_objective_module={axis_objective_path}")
 
 
 def _assert_runtime_files_are_patched(args: argparse.Namespace) -> None:
     decoder_path = inspect.getsourcefile(Decoder)
     loss_path = inspect.getsourcefile(diffusion_loss_func)
     v6_loss_path = inspect.getsourcefile(compute_signed_pair_monotonic_loss)
-    energy_path = inspect.getsourcefile(ConditionalPreferenceEnergy)
-    if not decoder_path or not loss_path or not v6_loss_path or not energy_path:
+    axis_objective_path = inspect.getsourcefile(ConditionalPreferenceEnergy)
+    if (
+        not decoder_path
+        or not loss_path
+        or not v6_loss_path
+        or not axis_objective_path
+    ):
         raise RuntimeError("Failed to resolve runtime source files for decoder/loss.")
 
     with open(decoder_path, "r", encoding="utf-8") as file_obj:
@@ -2191,8 +2098,8 @@ def _assert_runtime_files_are_patched(args: argparse.Namespace) -> None:
         loss_source = file_obj.read()
     with open(v6_loss_path, "r", encoding="utf-8") as file_obj:
         v6_loss_source = file_obj.read()
-    with open(energy_path, "r", encoding="utf-8") as file_obj:
-        energy_source = file_obj.read()
+    with open(axis_objective_path, "r", encoding="utf-8") as file_obj:
+        axis_objective_source = file_obj.read()
 
     decoder_markers = [
         'is_diffusion_loss_pass = ("sampled_trajectories" in inputs) and ("diffusion_time" in inputs)',
@@ -2203,7 +2110,6 @@ def _assert_runtime_files_are_patched(args: argparse.Namespace) -> None:
             [
                 "PreferenceAxisRouter",
                 "normal_anchor_style_value_condition",
-                "ConditionalPreferenceEnergy",
             ]
         )
     elif args.style_condition_encoder == "axis_router_v2_signed":
@@ -2250,7 +2156,7 @@ def _assert_runtime_files_are_patched(args: argparse.Namespace) -> None:
         'candidate_keys = ["x_start", "score"] if model_type == "x_start" else ["score"]',
     ]
     v6_loss_markers = []
-    energy_markers = []
+    axis_objective_markers = []
     if float(args.signed_monotonic_terminal_t_max) > 0.0:
         loss_markers.append('_training_clean_trajectories')
     if int(args.signed_monotonic_short_rollout_steps) > 0:
@@ -2278,7 +2184,7 @@ def _assert_runtime_files_are_patched(args: argparse.Namespace) -> None:
     if args.free_drive_accel_support_mode == "normal_anchor":
         decoder_markers.append("free_drive_accel_support_mode")
         v6_loss_markers.append("accel_opportunity_reference_output")
-        energy_markers.extend(
+        axis_objective_markers.extend(
             [
                 "accel_opportunity_reference_future",
                 "preference_ego_reference_future",
@@ -2290,17 +2196,25 @@ def _assert_runtime_files_are_patched(args: argparse.Namespace) -> None:
     missing_v6_loss = [
         marker for marker in v6_loss_markers if marker not in v6_loss_source
     ]
-    missing_energy = [
-        marker for marker in energy_markers if marker not in energy_source
+    missing_axis_objective = [
+        marker
+        for marker in axis_objective_markers
+        if marker not in axis_objective_source
     ]
-    if missing_decoder or missing_loss or missing_v6_loss or missing_energy:
+    if (
+        missing_decoder
+        or missing_loss
+        or missing_v6_loss
+        or missing_axis_objective
+    ):
         raise RuntimeError(
             "Patched diffusion runtime files are not active. "
             f"decoder_missing={missing_decoder}, loss_missing={missing_loss}, "
             f"v6_loss_missing={missing_v6_loss}, "
-            f"energy_missing={missing_energy}, decoder_path={decoder_path}, "
+            f"axis_objective_missing={missing_axis_objective}, "
+            f"decoder_path={decoder_path}, "
             f"loss_path={loss_path}, v6_loss_path={v6_loss_path}, "
-            f"energy_path={energy_path}"
+            f"axis_objective_path={axis_objective_path}"
         )
 
 
@@ -2322,7 +2236,6 @@ def main() -> None:
             0.95
             if args.experiment_preset
             in {
-                EXPERIMENT_PRESET_V6_AXIS_ROUTER_ANCHOR_ENERGY,
                 EXPERIMENT_PRESET_V6_SIGNED_ROUTER_STAGE_A,
                 EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A,
                 EXPERIMENT_PRESET_V6_SIGNED_ROUTER_NCQT_STAGE_A2,

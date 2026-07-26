@@ -103,7 +103,7 @@ For trained checkpoints, first generate that JSONL with
 It uses the V6 validation sidecar and planner cache, holds diffusion noise
 fixed across rho values, compares semantic rho=0 with the empty condition,
 and audits offline lane-change rows under an empty style condition.  It can
-also compare router-only, normal-anchor-CFG, and full-energy inference.
+also compare router-only and normal-anchor-CFG inference.
 
 NuPlan DB closed-loop evaluation remains a separate stage.  Use
 `research.preference_execution.eval.run_styleplanner_v6_closed_loop_suite` to

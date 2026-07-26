@@ -102,8 +102,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rho-values", default="-0.8,-0.4,0,0.4,0.8")
     parser.add_argument(
         "--variants",
-        default="full",
-        help="Comma-separated subset of router_only,anchor_cfg,full.",
+        default="anchor_cfg",
+        help="Comma-separated subset of router_only,anchor_cfg.",
     )
     parser.add_argument(
         "--max-samples-per-controlled-scene",
@@ -148,7 +148,6 @@ def _parser() -> argparse.ArgumentParser:
             "mutually exclusive with --cfg-guidance-scale."
         ),
     )
-    parser.add_argument("--energy-guidance-scale", type=float, default=None)
     parser.add_argument(
         "--require-stage-b-contract",
         action="store_true",
@@ -183,13 +182,13 @@ def _parse_int_list(raw: str) -> list[int]:
 
 
 def _parse_variants(raw: str) -> list[str]:
-    allowed = {"router_only", "anchor_cfg", "full"}
+    allowed = {"router_only", "anchor_cfg"}
     values = [value.strip() for value in str(raw).split(",") if value.strip()]
     unknown = sorted(set(values) - allowed)
     if not values or unknown:
         raise ValueError(f"variants must be selected from {sorted(allowed)}, got {unknown}")
     unique = list(dict.fromkeys(values))
-    # Router-only must run first when present so Stage-B/C variants can be
+    # Router-only must run first when present so Stage-B variants can be
     # audited against the exact same-sample, same-noise trajectory.
     return sorted(unique, key=lambda value: (value != "router_only", unique.index(value)))
 
@@ -214,7 +213,6 @@ def _build_variant_specs(
     variants: Sequence[str],
     *,
     cfg_default: float,
-    energy_default: float,
     cfg_scale_sweep: Sequence[float],
 ) -> list[Dict[str, Any]]:
     """Resolve canonical variants into collision-free runtime/output branches."""
@@ -229,7 +227,6 @@ def _build_variant_specs(
                     "key": "router_only",
                     "variant": "router_only",
                     "cfg_scale": 1.0,
-                    "energy_scale": 0.0,
                 }
             )
             continue
@@ -244,9 +241,6 @@ def _build_variant_specs(
                     "key": key,
                     "variant": variant,
                     "cfg_scale": float(scale),
-                    "energy_scale": (
-                        0.0 if variant == "anchor_cfg" else float(energy_default)
-                    ),
                 }
             )
     keys = [str(spec["key"]) for spec in specs]
@@ -325,8 +319,6 @@ def _model_args(args: argparse.Namespace) -> argparse.Namespace:
         model_args.preference_energy_rank_model_path = str(args.conditional_rank_model_path)
     if args.cfg_guidance_scale is not None:
         model_args.cfg_guidance_scale = float(args.cfg_guidance_scale)
-    if args.energy_guidance_scale is not None:
-        model_args.preference_energy_guidance_scale = float(args.energy_guidance_scale)
     if str(getattr(model_args, "style_condition_encoder", "")) == "axis_router_v2_signed":
         if not getattr(model_args, "preference_energy_normalization_path", ""):
             raise ValueError(
@@ -336,11 +328,9 @@ def _model_args(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(
                 "Signed-router evaluation requires the frozen conditional-rank reference"
             )
-        # Stage A disables energy during training and sampling. The evaluator
-        # still instantiates the frozen reference object so it can audit the
-        # final trajectory in the common V6 percentile space. Variant scale 0
-        # guarantees that this measurement cannot modify the trajectory.
-        model_args.preference_energy_enabled = True
+        # Instantiate the frozen reference object only to measure final
+        # trajectories in the common V6 percentile space.
+        model_args.preference_axis_diagnostics_enabled = True
     model_args.state_normalizer = StateNormalizer.from_json(model_args)
     model_args.observation_normalizer = ObservationNormalizer.from_json(model_args)
     return model_args
@@ -662,26 +652,10 @@ def _write_condition_subset(
     return written
 
 
-def _variant_scales(
-    variant: str,
-    *,
-    cfg_scale: float,
-    energy_scale: float,
-) -> tuple[float, float]:
-    if variant == "router_only":
-        return 1.0, 0.0
-    if variant == "anchor_cfg":
-        return float(cfg_scale), 0.0
-    if variant == "full":
-        return float(cfg_scale), float(energy_scale)
-    raise ValueError(variant)
-
-
 def _configure_variant_runtime(
     model: Diffusion_Planner,
     *,
     variant: str,
-    energy_scale: float,
 ) -> None:
     """Select one inference module without mutating checkpoint parameters.
 
@@ -693,8 +667,7 @@ def _configure_variant_runtime(
     """
 
     decoder = model.decoder.decoder
-    decoder._normal_anchor_cfg_enabled = variant in {"anchor_cfg", "full"}
-    decoder._preference_energy_guidance_scale = float(energy_scale)
+    decoder._normal_anchor_cfg_enabled = variant == "anchor_cfg"
 
 
 def _populate_base_cache(
@@ -837,7 +810,6 @@ def _run_checkpoint(
             _configure_variant_runtime(
                 model,
                 variant="router_only",
-                energy_scale=0.0,
             )
             eligibility_seed = int(args.seed + dataset_index * 10007)
             _set_seed(eligibility_seed)
@@ -891,11 +863,9 @@ def _run_checkpoint(
                     variant_key = str(spec["key"])
                     variant = str(spec["variant"])
                     cfg_scale = float(spec["cfg_scale"])
-                    energy_scale = float(spec["energy_scale"])
                     _configure_variant_runtime(
                         model,
                         variant=variant,
-                        energy_scale=energy_scale,
                     )
                     variant_retention = retention[variant_key]
                     variant_retention["controlled_base_ade"].append(base_metrics["ade"])
@@ -1102,20 +1072,10 @@ def _run_checkpoint(
                                 "normal_anchor_cfg_used", False
                             ),
                             "normal_anchor_cfg_requested": variant
-                            in {"anchor_cfg", "full"},
+                            == "anchor_cfg",
                             "normal_anchor_cfg_scale": float(cfg_scale),
                             "empty_cfg_reference_used": diagnostics.get(
                                 "empty_cfg_reference_used", False
-                            ),
-                            "preference_energy_guidance_used": diagnostics.get(
-                                "preference_energy_guidance_used", False
-                            ),
-                            "preference_energy": diagnostics.get("preference_energy", 0.0),
-                            "preference_axis_energy": diagnostics.get(
-                                "preference_axis_energy", 0.0
-                            ),
-                            "preference_safety_energy": diagnostics.get(
-                                "preference_safety_energy", 0.0
                             ),
                         }
                         detail_files[variant_key].write(
@@ -1264,7 +1224,6 @@ def _run_checkpoint(
             values = retention[variant_key].get(key, [])
             retention_report[f"{key}_max"] = _maximum(values)
         cfg_scale = float(spec["cfg_scale"])
-        energy_scale = float(spec["energy_scale"])
         retention_report.update(
             {
                 "controlled_sample_count": int(
@@ -1280,9 +1239,8 @@ def _run_checkpoint(
                 "variant": variant_key,
                 "variant_base": variant,
                 "normal_anchor_cfg_requested": variant
-                in {"anchor_cfg", "full"},
+                == "anchor_cfg",
                 "cfg_guidance_scale": float(cfg_scale),
-                "energy_guidance_scale": float(energy_scale),
                 "preference_axis_reference_mode": (
                     "normal_neighbor"
                     if fixed_normal_neighbors
@@ -1304,7 +1262,6 @@ def _run_checkpoint(
             "generated_axis_path": str(detail_paths[variant_key]),
             "variant_base": variant,
             "cfg_guidance_scale": cfg_scale,
-            "energy_guidance_scale": energy_scale,
         }
 
     stage_b_contracts: Dict[str, Any] = {}
@@ -1460,9 +1417,9 @@ def main() -> None:
             "--cfg-guidance-scales is the post-contract effect sweep and "
             "requires every scale to be greater than 1.0"
         )
-    if cfg_scale_sweep and not {"anchor_cfg", "full"}.intersection(variants):
+    if cfg_scale_sweep and "anchor_cfg" not in variants:
         raise ValueError(
-            "--cfg-guidance-scales requires anchor_cfg or full in --variants"
+            "--cfg-guidance-scales requires anchor_cfg in --variants"
         )
     if args.require_stage_b_contract and not {
         "router_only",
@@ -1478,13 +1435,9 @@ def main() -> None:
 
     model_args = _model_args(args)
     cfg_default = float(getattr(model_args, "cfg_guidance_scale", 1.5))
-    energy_default = float(
-        getattr(model_args, "preference_energy_guidance_scale", 0.0)
-    )
     variant_specs = _build_variant_specs(
         variants,
         cfg_default=cfg_default,
-        energy_default=energy_default,
         cfg_scale_sweep=cfg_scale_sweep,
     )
     variant_keys = [str(spec["key"]) for spec in variant_specs]
@@ -1519,8 +1472,8 @@ def main() -> None:
 
     base_args = copy.copy(model_args)
     # Empty-condition baseline predictions do not need the expensive frozen
-    # conditional-rank energy module.
-    base_args.preference_energy_enabled = False
+    # conditional-rank axis diagnostics.
+    base_args.preference_axis_diagnostics_enabled = False
     base_model, base_meta = _load_model(
         base_args,
         args.base_checkpoint_path,

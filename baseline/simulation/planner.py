@@ -858,9 +858,6 @@ class StylePlanner(DiffusionPlanner):
                 "cfg_guidance_scale": (
                     self._online_preference_conditioner.cfg_guidance_scale
                 ),
-                "preference_energy_guidance_scale": (
-                    self._online_preference_conditioner.preference_energy_guidance_scale
-                ),
             }
         return {
             "enabled": True,
@@ -898,23 +895,19 @@ class StylePlanner(DiffusionPlanner):
             "axis_router_availability",
             "normal_anchor_cfg_used",
             "empty_cfg_reference_used",
-            "preference_energy_guidance_used",
-            "preference_energy",
-            "preference_axis_energy",
-            "preference_safety_energy",
             "preference_command_strength",
             "preference_generated_axis_percentile",
             "preference_generated_raw_axis",
             "preference_generated_axis_valid_mask",
             "preference_target_axis_percentile",
-            "preference_energy_support_reason_code",
-            "preference_energy_shared_condition_count",
-            "preference_energy_speed_limit_source_code",
-            "preference_energy_speed_limit_valid",
-            "preference_energy_route_curvature_valid",
-            "preference_energy_free_drive_clear",
-            "preference_energy_active_traffic_control",
-            "preference_energy_reference_valid_axis_mask",
+            "preference_axis_reference_support_reason_code",
+            "preference_axis_reference_shared_condition_count",
+            "preference_axis_reference_speed_limit_source_code",
+            "preference_axis_reference_speed_limit_valid",
+            "preference_axis_reference_route_curvature_valid",
+            "preference_axis_reference_free_drive_clear",
+            "preference_axis_reference_active_traffic_control",
+            "preference_axis_reference_valid_axis_mask",
         )
         for key in temporal_keys:
             value = outputs.get(key)

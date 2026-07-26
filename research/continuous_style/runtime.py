@@ -46,18 +46,8 @@ class ContinuousStyleRuntimeConditioner(OnlinePreferenceConditioner):
         self._cfg_guidance_scale = float(
             getattr(config, "cfg_guidance_scale", 1.0)
         )
-        self._preference_energy_guidance_scale = float(
-            getattr(config, "preference_energy_guidance_scale", 0.0)
-        )
         if not np.isfinite(self._cfg_guidance_scale) or self._cfg_guidance_scale < 0.0:
             raise ValueError("cfg_guidance_scale must be finite and non-negative")
-        if (
-            not np.isfinite(self._preference_energy_guidance_scale)
-            or self._preference_energy_guidance_scale < 0.0
-        ):
-            raise ValueError(
-                "preference_energy_guidance_scale must be finite and non-negative"
-            )
         if self._normal_anchor_cfg_enabled and self._cfg_guidance_scale < 1.0:
             raise ValueError(
                 "normal-anchor CFG requires cfg_guidance_scale >= 1.0; "
@@ -102,10 +92,6 @@ class ContinuousStyleRuntimeConditioner(OnlinePreferenceConditioner):
     @property
     def cfg_guidance_scale(self) -> float:
         return self._cfg_guidance_scale
-
-    @property
-    def preference_energy_guidance_scale(self) -> float:
-        return self._preference_energy_guidance_scale
 
     def set_command(self, rho: float | None = None, **_: object) -> None:
         if rho is not None:
@@ -214,10 +200,10 @@ class ContinuousStyleRuntimeConditioner(OnlinePreferenceConditioner):
             mask.astype(np.float32)[None, :], dtype=torch.float32, device=device
         )
         model_inputs["causal_axis_mask"] = torch.as_tensor(mask[None, :], dtype=torch.float32, device=device)
-        # Frozen-reference preference energy must use physical, unnormalized
-        # observations. These keys are consumed only by StylePlanner's optional
-        # energy module and never by the encoder or the base diffusion planner.
-        raw_energy_keys = {
+        # Frozen-reference axis diagnostics use physical, unnormalized
+        # observations. These keys are never consumed by the encoder or the base
+        # diffusion planner.
+        raw_axis_reference_keys = {
             "preference_ego_current_state_raw": "ego_current_state",
             "preference_ego_agent_past_raw": "ego_agent_past",
             "preference_neighbor_agents_past_raw": "neighbor_agents_past",
@@ -231,7 +217,7 @@ class ContinuousStyleRuntimeConditioner(OnlinePreferenceConditioner):
             "preference_route_lanes_speed_limit_raw": "route_lanes_speed_limit",
             "preference_route_lanes_has_speed_limit_raw": "route_lanes_has_speed_limit",
         }
-        for output_key, raw_key in raw_energy_keys.items():
+        for output_key, raw_key in raw_axis_reference_keys.items():
             value = raw_inputs.get(raw_key)
             if value is not None:
                 model_inputs[output_key] = value.to(device)
@@ -244,9 +230,6 @@ class ContinuousStyleRuntimeConditioner(OnlinePreferenceConditioner):
             "rho_requested": float(self._rho),
             "normal_anchor_cfg_requested": self._normal_anchor_cfg_enabled,
             "cfg_guidance_scale": self._cfg_guidance_scale,
-            "preference_energy_guidance_scale_requested": (
-                self._preference_energy_guidance_scale
-            ),
             "scene_bucket": scene_bucket,
             "scene_axis_names": list(CANONICAL_AXIS_BY_SCENE.get(scene_bucket, ("", "", ""))),
             "causal_scene_bucket": scene_bucket,

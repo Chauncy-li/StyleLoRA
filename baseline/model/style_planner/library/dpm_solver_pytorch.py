@@ -188,12 +188,6 @@ def model_wrapper(
     guidance_scale=1.,
     classifier_fn=None,
     classifier_kwargs={},
-    energy_fn=None,
-    energy_scale=0.0,
-    energy_kwargs={},
-    energy_grad_clip=1.0,
-    energy_t_min=0.01,
-    energy_t_max=0.55,
 ):
     """Create a wrapper function for the noise prediction model.
 
@@ -322,70 +316,22 @@ def model_wrapper(
             log_prob = classifier_fn(x_in, t_input, condition, **classifier_kwargs)
             return torch.autograd.grad(log_prob.sum(), x_in)[0]
 
-    def energy_grad_fn(x, t_continuous):
-        """Differentiate a trajectory energy through the x-start prediction."""
-
-        if energy_fn is None or float(energy_scale) <= 0.0:
-            return None
-        if model_type != "x_start":
-            raise ValueError("Differentiable preference energy currently requires model_type='x_start'")
-        active_time = (
-            (t_continuous >= float(energy_t_min))
-            & (t_continuous <= float(energy_t_max))
-        )
-        if not bool(active_time.any()):
-            return torch.zeros_like(x)
-        t_input = get_model_input_time(t_continuous)
-        with torch.enable_grad():
-            x_in = x.detach().requires_grad_(True)
-            model_output = model(x_in, t_input, condition, **model_kwargs)
-            energy = energy_fn(
-                model_output,
-                t_input,
-                condition,
-                **energy_kwargs,
-            )
-            if not torch.is_tensor(energy):
-                energy = torch.as_tensor(energy, device=x.device, dtype=x.dtype)
-            gradient = torch.autograd.grad(
-                energy.sum(),
-                x_in,
-                allow_unused=True,
-            )[0]
-        if gradient is None:
-            return torch.zeros_like(x)
-
-        t_mask = active_time.to(dtype=gradient.dtype)
-        while t_mask.dim() < gradient.dim():
-            t_mask = t_mask.unsqueeze(-1)
-        gradient = gradient * t_mask
-
-        clip = max(float(energy_grad_clip), 0.0)
-        if clip > 0.0:
-            flat = gradient.reshape(gradient.shape[0], -1)
-            norm = torch.linalg.norm(flat, dim=-1).clamp_min(1e-8)
-            scale = torch.clamp(clip / norm, max=1.0)
-            while scale.dim() < gradient.dim():
-                scale = scale.unsqueeze(-1)
-            gradient = gradient * scale
-        return gradient
-
     def model_fn(x, t_continuous):
         """
         The noise predicition model function that is used for DPM-Solver.
         """
         if guidance_type == "uncond":
-            guided_noise = noise_pred_fn(x, t_continuous)
+            return noise_pred_fn(x, t_continuous)
         elif guidance_type == "classifier":
             assert classifier_fn is not None
             t_input = get_model_input_time(t_continuous)
             cond_grad = cond_grad_fn(x, t_input)
             sigma_t = noise_schedule.marginal_std(t_continuous)
             noise = noise_pred_fn(x, t_continuous)
-            guided_noise = noise - guidance_scale * expand_dims(sigma_t, x.dim()) * cond_grad
+            return noise - guidance_scale * expand_dims(sigma_t, x.dim()) * cond_grad
         elif guidance_type == "classifier-free":
             if guidance_scale == 1. or unconditional_condition is None:
-                guided_noise = noise_pred_fn(x, t_continuous, cond=condition)
+                return noise_pred_fn(x, t_continuous, cond=condition)
             else:
                 # x_in = torch.cat([x] * 2)
                 # t_in = torch.cat([t_continuous] * 2)
@@ -393,20 +339,7 @@ def model_wrapper(
                 # noise_uncond, noise = noise_pred_fn(x_in, t_in, cond=c_in).chunk(2)
                 noise_uncond = noise_pred_fn(x, t_continuous, cond=unconditional_condition)
                 noise = noise_pred_fn(x, t_continuous, cond=condition)
-                guided_noise = noise_uncond + guidance_scale * (noise - noise_uncond)
-        else:
-            raise ValueError(f"Unsupported guidance_type={guidance_type!r}")
-
-        energy_gradient = energy_grad_fn(x, t_continuous)
-        if energy_gradient is not None:
-            # score_guided = score - lambda * grad(E), therefore the
-            # equivalent noise prediction adds lambda * sigma * grad(E).
-            sigma_t = noise_schedule.marginal_std(t_continuous)
-            guided_noise = guided_noise + float(energy_scale) * expand_dims(
-                sigma_t,
-                x.dim(),
-            ) * energy_gradient
-        return guided_noise
+                return noise_uncond + guidance_scale * (noise - noise_uncond)
 
     assert model_type in ["noise", "x_start", "v", "score"]
     assert guidance_type in ["uncond", "classifier", "classifier-free"]

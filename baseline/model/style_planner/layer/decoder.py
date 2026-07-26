@@ -242,25 +242,11 @@ class Decoder(nn.Module):
         
         self._state_normalizer: StateNormalizer = config.state_normalizer
         self._observation_normalizer: ObservationNormalizer = config.observation_normalizer
-        self._preference_energy_enabled = bool(
-            getattr(config, "preference_energy_enabled", False)
+        self._preference_axis_diagnostics_enabled = bool(
+            getattr(config, "preference_axis_diagnostics_enabled", False)
         )
-        self._preference_energy_guidance_scale = float(
-            getattr(config, "preference_energy_guidance_scale", 0.0)
-        )
-        self._preference_energy_grad_clip = float(
-            getattr(config, "preference_energy_grad_clip", 0.5)
-        )
-        self._preference_energy_t_min = float(
-            getattr(config, "preference_energy_t_min", 0.01)
-        )
-        self._preference_energy_t_max = float(
-            getattr(config, "preference_energy_t_max", 0.55)
-        )
-        if self._preference_energy_enabled:
-            if self.dit.model_type != "x_start":
-                raise ValueError("preference energy requires diffusion_model_type='x_start'")
-            self.preference_energy = ConditionalPreferenceEnergy(
+        if self._preference_axis_diagnostics_enabled:
+            self.preference_axis_objective = ConditionalPreferenceEnergy(
                 normalization_path=str(
                     getattr(config, "preference_energy_normalization_path", "")
                 ),
@@ -275,12 +261,6 @@ class Decoder(nn.Module):
                 cdf_temperature=float(
                     getattr(config, "preference_energy_cdf_temperature", 0.04)
                 ),
-                preference_weight=float(
-                    getattr(config, "preference_energy_preference_weight", 1.0)
-                ),
-                safety_weight=float(
-                    getattr(config, "preference_energy_safety_weight", 4.0)
-                ),
                 free_drive_accel_support_mode=str(
                     getattr(
                         config,
@@ -291,7 +271,7 @@ class Decoder(nn.Module):
                 dt=float(getattr(config, "preference_loss_dt", 0.1)),
             )
         else:
-            self.preference_energy = None
+            self.preference_axis_objective = None
         
         self._guidance_fn = config.guidance_fn
         
@@ -372,22 +352,6 @@ class Decoder(nn.Module):
                     outputs.update(temporal_debug)
                 if router_debug is not None:
                     outputs.update(router_debug)
-                if (
-                    self.preference_energy is not None
-                    and style_condition is not None
-                    and not bool(inputs.get("disable_preference_energy", False))
-                ):
-                    prepared_energy = self.preference_energy.prepare(
-                        inputs,
-                        style_condition,
-                    )
-                    outputs.update(
-                        self.preference_energy.energy_terms(
-                            denoised,
-                            inputs,
-                            prepared_energy,
-                        )
-                    )
                 return outputs
             outputs = {
                 "score": denoised
@@ -470,44 +434,15 @@ class Decoder(nn.Module):
                     "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"
                 }
 
-            prepared_energy = None
-            energy_guidance_applied = False
-            command_strength = 0.0
-            if style_active and style_condition is not None:
-                axis_mask = style_condition[:, 3:6].clamp(0.0, 1.0)
-                target_delta = (style_condition[:, 0:3] - 0.5).abs()
-                command_strength = float(
-                    ((target_delta * axis_mask).sum() / axis_mask.sum().clamp_min(1.0))
-                    .detach()
-                    .cpu()
-                )
+            prepared_axis_diagnostics = None
             if (
-                self.preference_energy is not None
+                self.preference_axis_objective is not None
                 and style_active
             ):
-                prepared_energy = self.preference_energy.prepare(
+                prepared_axis_diagnostics = self.preference_axis_objective.prepare(
                     inputs,
                     style_condition,
                 )
-                if (
-                    bool(prepared_energy["enabled"].any())
-                    and command_strength > 1e-5
-                    and self._preference_energy_guidance_scale > 0.0
-                ):
-                    model_wrapper_params.update(
-                        {
-                            "energy_fn": self.preference_energy.energy_from_model_output,
-                            "energy_scale": self._preference_energy_guidance_scale,
-                            "energy_kwargs": {
-                                "inputs": inputs,
-                                "prepared": prepared_energy,
-                            },
-                            "energy_grad_clip": self._preference_energy_grad_clip,
-                            "energy_t_min": self._preference_energy_t_min,
-                            "energy_t_max": self._preference_energy_t_max,
-                        }
-                    )
-                    energy_guidance_applied = True
 
             x0 = dpm_sampler(
                         self.dit,
@@ -528,27 +463,24 @@ class Decoder(nn.Module):
                             if sampling_t_start is not None
                             else {}
                         ),
-                )
+            )
             if (
-                self.preference_energy is not None
-                and prepared_energy is not None
-                and bool(prepared_energy["enabled"].any())
+                self.preference_axis_objective is not None
+                and prepared_axis_diagnostics is not None
             ):
-                # Always audit the final generated conditional percentiles,
-                # including rho=0 where the energy gradient is intentionally
-                # disabled. This gives the rho-sweep evaluator a common output
-                # contract without changing the trajectory.
-                self.preference_energy.energy_terms(
+                # Read-only final-trajectory diagnostics share the frozen
+                # conditional reference used by NCQT and never alter sampling.
+                self.preference_axis_objective.axis_diagnostic_terms(
                     x0.reshape(B, P, -1, 4),
                     inputs,
-                    prepared_energy,
+                    prepared_axis_diagnostics,
                 )
             if temporal_debug is None:
                 temporal_debug = self.dit.pop_last_temporal_gate_outputs()
             router_debug = self.dit.pop_last_axis_router_outputs()
-            energy_debug = (
-                self.preference_energy.pop_last_diagnostics()
-                if self.preference_energy is not None
+            axis_diagnostic_debug = (
+                self.preference_axis_objective.pop_last_diagnostics()
+                if self.preference_axis_objective is not None
                 else None
             )
             x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
@@ -567,19 +499,13 @@ class Decoder(nn.Module):
                     dtype=torch.bool,
                     device=x0.device,
                 ),
-                "preference_energy_guidance_used": torch.full(
-                    (B,),
-                    energy_guidance_applied,
-                    dtype=torch.bool,
-                    device=x0.device,
-                ),
             }
             if temporal_debug is not None:
                 outputs.update(temporal_debug)
             if router_debug is not None:
                 outputs.update(router_debug)
-            if energy_debug is not None:
-                outputs.update(energy_debug)
+            if axis_diagnostic_debug is not None:
+                outputs.update(axis_diagnostic_debug)
             return outputs
 
     def _build_warm_start_state(self, inputs, current_states, neighbor_current_mask):

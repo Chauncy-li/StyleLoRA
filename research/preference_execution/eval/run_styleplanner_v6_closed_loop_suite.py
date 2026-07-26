@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import math
 import os
@@ -31,7 +30,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_DEVKIT_ROOT = REPO_ROOT / "nuplan-devkit"
 CHECKPOINT_EPOCH_PATTERN = re.compile(r"(?:model|checkpoint)_epoch_(\d+)")
-SUPPORTED_VARIANTS = ("router_only", "anchor_cfg", "full_energy")
+SUPPORTED_VARIANTS = ("router_only", "anchor_cfg")
 CONTROLLED_RUNTIME_SCENES = (
     "straight_free_drive",
     "straight_car_follow",
@@ -69,98 +68,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variants",
         default="router_only,anchor_cfg",
-        help=(
-            "Comma-separated variants: router_only,anchor_cfg,full_energy. "
-            "Stage C compares anchor_cfg against full_energy."
-        ),
+        help="Comma-separated variants: router_only,anchor_cfg.",
     )
     parser.add_argument(
         "--normal-anchor-cfg-scale",
         type=float,
         default=1.1,
-        help="Fixed Normal-Anchor CFG scale used by anchor_cfg and full_energy.",
-    )
-    parser.add_argument(
-        "--preference-energy-guidance-scale",
-        type=float,
-        default=0.0,
-        help=(
-            "Energy scale used only by full_energy. It must remain 0.0 when "
-            "full_energy is not selected."
-        ),
-    )
-    parser.add_argument(
-        "--preference-energy-normalization-path",
-        default="",
-        help=(
-            "Frozen train-only V5 normalization JSON. Required by full_energy; "
-            "an empty value falls back to the checkpoint args.json."
-        ),
-    )
-    parser.add_argument(
-        "--preference-energy-rank-model-path",
-        default="",
-        help=(
-            "Frozen train-only conditional rank-model JSON. Required by "
-            "full_energy; an empty value falls back to the checkpoint args.json."
-        ),
-    )
-    parser.add_argument(
-        "--preference-energy-neighbours",
-        type=int,
-        default=64,
-    )
-    parser.add_argument(
-        "--preference-energy-min-shared-features",
-        type=int,
-        default=3,
-    )
-    parser.add_argument(
-        "--preference-energy-cdf-temperature",
-        type=float,
-        default=0.04,
-    )
-    parser.add_argument(
-        "--preference-energy-preference-weight",
-        type=float,
-        default=1.0,
-    )
-    parser.add_argument(
-        "--preference-energy-safety-weight",
-        type=float,
-        default=4.0,
-    )
-    parser.add_argument(
-        "--preference-energy-grad-clip",
-        type=float,
-        default=0.50,
-    )
-    parser.add_argument(
-        "--preference-energy-t-min",
-        type=float,
-        default=0.01,
-    )
-    parser.add_argument(
-        "--preference-energy-t-max",
-        type=float,
-        default=0.55,
-    )
-    parser.add_argument(
-        "--free-drive-accel-support-mode",
-        choices=("self_generated", "normal_anchor"),
-        default="self_generated",
-        help=(
-            "Keep self_generated for the first Stage-C isolation so Energy is "
-            "the only newly enabled mechanism."
-        ),
-    )
-    parser.add_argument(
-        "--require-stage-c-energy-contract",
-        action="store_true",
-        help=(
-            "Require the isolated Stage-C anchor_cfg/full_energy comparison, "
-            "fixed CFG=1.1, rho negative/zero/positive, and exact scenario tokens."
-        ),
+        help="Fixed Normal-Anchor CFG scale used by anchor_cfg.",
     )
     parser.add_argument(
         "--require-a3-8-terminal-executor",
@@ -304,81 +218,10 @@ def _parse_variants(raw: str) -> list[str]:
     return variants
 
 
-def _validate_guidance_controls(
-    args: argparse.Namespace,
-    *,
-    variants: Sequence[str],
-    rho_values: Sequence[float],
-) -> None:
+def _validate_guidance_controls(args: argparse.Namespace) -> None:
     scale = float(args.normal_anchor_cfg_scale)
-    energy_scale = float(args.preference_energy_guidance_scale)
     if not math.isfinite(scale) or scale < 1.0:
         raise ValueError("--normal-anchor-cfg-scale must be finite and >= 1.0")
-    if not math.isfinite(energy_scale) or energy_scale < 0.0:
-        raise ValueError(
-            "--preference-energy-guidance-scale must be finite and non-negative"
-        )
-    energy_selected = "full_energy" in variants
-    if energy_selected and energy_scale <= 0.0:
-        raise ValueError(
-            "full_energy requires --preference-energy-guidance-scale > 0"
-        )
-    if not energy_selected and abs(energy_scale) > 1e-12:
-        raise ValueError(
-            "Energy scale must remain exactly 0.0 unless full_energy is selected"
-        )
-    if int(args.preference_energy_neighbours) < 1:
-        raise ValueError("--preference-energy-neighbours must be >= 1")
-    if int(args.preference_energy_min_shared_features) < 1:
-        raise ValueError(
-            "--preference-energy-min-shared-features must be >= 1"
-        )
-    for name in (
-        "preference_energy_cdf_temperature",
-        "preference_energy_grad_clip",
-    ):
-        value = float(getattr(args, name))
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(
-                f"--{name.replace('_', '-')} must be finite and positive"
-            )
-    for name in (
-        "preference_energy_preference_weight",
-        "preference_energy_safety_weight",
-    ):
-        value = float(getattr(args, name))
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError(
-                f"--{name.replace('_', '-')} must be finite and non-negative"
-            )
-    energy_t_min = float(args.preference_energy_t_min)
-    energy_t_max = float(args.preference_energy_t_max)
-    if not (
-        math.isfinite(energy_t_min)
-        and math.isfinite(energy_t_max)
-        and 0.0 <= energy_t_min < energy_t_max <= 1.0
-    ):
-        raise ValueError(
-            "--preference-energy-t-min/max must satisfy "
-            "0 <= t_min < t_max <= 1"
-        )
-    if args.require_stage_c_energy_contract:
-        if list(variants) != ["anchor_cfg", "full_energy"]:
-            raise ValueError(
-                "Stage-C isolation requires exactly "
-                "--variants anchor_cfg,full_energy"
-            )
-        if not math.isclose(scale, 1.1, abs_tol=1e-12):
-            raise ValueError(
-                "Stage-C isolation fixes --normal-anchor-cfg-scale at 1.1"
-            )
-        has_negative = any(value < -1e-12 for value in rho_values)
-        has_zero = any(abs(value) <= 1e-12 for value in rho_values)
-        has_positive = any(value > 1e-12 for value in rho_values)
-        if not (has_negative and has_zero and has_positive):
-            raise ValueError(
-                "Stage-C isolation requires negative, zero, and positive rho values"
-            )
     if int(args.router_audit_window_steps) < 0:
         raise ValueError("--router-audit-window-steps must be >= 0")
     if int(args.min_router_active_steps) < 1:
@@ -420,31 +263,19 @@ def _variant_contract(
     variant: str,
     *,
     normal_anchor_cfg_scale: float,
-    preference_energy_guidance_scale: float,
 ) -> Dict[str, Any]:
     if variant == "router_only":
         normal_anchor_enabled = False
         cfg_scale = 1.0
-        energy_enabled = False
-        energy_scale = 0.0
     elif variant == "anchor_cfg":
         normal_anchor_enabled = True
         cfg_scale = float(normal_anchor_cfg_scale)
-        energy_enabled = False
-        energy_scale = 0.0
-    elif variant == "full_energy":
-        normal_anchor_enabled = True
-        cfg_scale = float(normal_anchor_cfg_scale)
-        energy_enabled = True
-        energy_scale = float(preference_energy_guidance_scale)
     else:
         raise ValueError(f"Unsupported guidance variant: {variant!r}")
     return {
         "variant": variant,
         "normal_anchor_cfg_enabled": normal_anchor_enabled,
         "cfg_guidance_scale": cfg_scale,
-        "preference_energy_enabled": energy_enabled,
-        "preference_energy_guidance_scale": energy_scale,
     }
 
 
@@ -452,13 +283,6 @@ def _variant_tag(contract: Dict[str, Any]) -> str:
     if not bool(contract["normal_anchor_cfg_enabled"]):
         return "router_only"
     scale = f"{float(contract['cfg_guidance_scale']):g}".replace("-", "m").replace(".", "p")
-    if bool(contract["preference_energy_enabled"]):
-        energy_scale = (
-            f"{float(contract['preference_energy_guidance_scale']):g}"
-            .replace("-", "m")
-            .replace(".", "p")
-        )
-        return f"full_energy_s{scale}_e{energy_scale}"
     return f"anchor_cfg_s{scale}"
 
 
@@ -659,24 +483,10 @@ def _audit_runtime_contract(
     total_rows = 0
     normal_anchor_used_rows = 0
     empty_reference_used_rows = 0
-    energy_used_rows = 0
-    energy_used_without_controlled_router_rows = 0
-    energy_nonfinite_diagnostic_rows = 0
-    energy_diagnostic_valid_rows = 0
-    energy_used_scene_counts: Counter[str] = Counter()
-    energy_diagnostic_scene_counts: Counter[str] = Counter()
-    energy_support_reason_counts = {
-        scene: Counter() for scene in CONTROLLED_RUNTIME_SCENES
-    }
-    energy_speed_limit_source_counts = {
-        scene: Counter() for scene in CONTROLLED_RUNTIME_SCENES
-    }
     mismatches: list[Dict[str, Any]] = []
     trace_rows_by_path: list[tuple[Path, list[Mapping[str, Any]]]] = []
     expected_anchor = bool(contract["normal_anchor_cfg_enabled"])
-    expected_energy = bool(contract["preference_energy_enabled"])
     expected_cfg_scale = float(contract["cfg_guidance_scale"])
-    expected_energy_scale = float(contract["preference_energy_guidance_scale"])
     for trace_path in trace_paths:
         trace_rows: list[Mapping[str, Any]] = []
         with open(trace_path, "r", encoding="utf-8") as file_obj:
@@ -697,12 +507,6 @@ def _audit_runtime_contract(
                     "cfg_guidance_scale": float(
                         execution.get("cfg_guidance_scale", math.nan)
                     ),
-                    "preference_energy_guidance_scale_requested": float(
-                        execution.get(
-                            "preference_energy_guidance_scale_requested",
-                            math.nan,
-                        )
-                    ),
                 }
                 row_mismatches = {}
                 if not math.isclose(
@@ -721,14 +525,6 @@ def _audit_runtime_contract(
                     row_mismatches["cfg_guidance_scale"] = actual[
                         "cfg_guidance_scale"
                     ]
-                if not math.isclose(
-                    actual["preference_energy_guidance_scale_requested"],
-                    expected_energy_scale,
-                    abs_tol=1e-8,
-                ):
-                    row_mismatches[
-                        "preference_energy_guidance_scale_requested"
-                    ] = actual["preference_energy_guidance_scale_requested"]
                 if row_mismatches and len(mismatches) < 20:
                     mismatches.append(
                         {
@@ -743,110 +539,12 @@ def _audit_runtime_contract(
                 empty_reference_used_rows += int(
                     bool(execution.get("empty_cfg_reference_used", False))
                 )
-                energy_used = bool(
-                    execution.get("preference_energy_guidance_used", False)
-                )
-                energy_used_rows += int(energy_used)
-                router_scene = _trace_row_router_scene(row)
-                controlled_router_active = (
-                    router_scene in CONTROLLED_RUNTIME_SCENES
-                )
-                energy_support = execution.get("energy_support", {})
-                if not isinstance(energy_support, Mapping):
-                    energy_support = {}
-                if controlled_router_active:
-                    support_reason = str(
-                        energy_support.get("reason", "trace_field_missing")
-                    )
-                    speed_limit_source = str(
-                        energy_support.get(
-                            "speed_limit_source",
-                            "trace_field_missing",
-                        )
-                    )
-                    energy_support_reason_counts[router_scene][
-                        support_reason
-                    ] += 1
-                    energy_speed_limit_source_counts[router_scene][
-                        speed_limit_source
-                    ] += 1
-                if energy_used:
-                    if controlled_router_active:
-                        energy_used_scene_counts[router_scene] += 1
-                    else:
-                        energy_used_without_controlled_router_rows += 1
-                energy_scalars = (
-                    execution.get("preference_energy", 0.0),
-                    execution.get("preference_axis_energy", 0.0),
-                    execution.get("preference_safety_energy", 0.0),
-                )
-                if not all(
-                    math.isfinite(float(value)) for value in energy_scalars
-                ):
-                    energy_nonfinite_diagnostic_rows += 1
-                generated_valid = execution.get(
-                    "generated_axis_valid_mask",
-                    (),
-                )
-                if isinstance(generated_valid, Sequence) and not isinstance(
-                    generated_valid,
-                    (str, bytes),
-                ):
-                    diagnostic_valid = any(bool(value) for value in generated_valid)
-                else:
-                    diagnostic_valid = False
-                if diagnostic_valid:
-                    energy_diagnostic_valid_rows += 1
-                    if controlled_router_active:
-                        energy_diagnostic_scene_counts[router_scene] += 1
         trace_rows_by_path.append((trace_path, trace_rows))
 
     if total_rows <= 0:
         raise RuntimeError(
             f"Runtime trace files exist but contain no rows under {run_dir}"
         )
-    if not expected_energy and energy_used_rows > 0:
-        mismatches.append(
-            {
-                "preference_energy_guidance_used_rows": energy_used_rows,
-                "expected": 0,
-            }
-        )
-    if expected_energy:
-        if energy_nonfinite_diagnostic_rows > 0:
-            mismatches.append(
-                {
-                    "energy_nonfinite_diagnostic_rows": (
-                        energy_nonfinite_diagnostic_rows
-                    ),
-                    "expected": 0,
-                }
-            )
-        if energy_used_without_controlled_router_rows > 0:
-            mismatches.append(
-                {
-                    "energy_used_without_controlled_router_rows": (
-                        energy_used_without_controlled_router_rows
-                    ),
-                    "expected": 0,
-                }
-            )
-        if abs(float(rho)) <= 1e-12:
-            if energy_used_rows > 0:
-                mismatches.append(
-                    {
-                        "rho_zero_energy_guidance_used_rows": energy_used_rows,
-                        "expected": 0,
-                        "reason": "rho=0 must preserve the selected CFG baseline",
-                    }
-                )
-        elif energy_used_rows <= 0:
-            mismatches.append(
-                {
-                    "preference_energy_guidance_used_rows": energy_used_rows,
-                    "expected": "> 0 for non-zero rho in full_energy",
-                }
-            )
     if not expected_anchor and normal_anchor_used_rows > 0:
         mismatches.append(
             {
@@ -957,87 +655,12 @@ def _audit_runtime_contract(
                 "eligible_scene_counts": dict(eligible_scene_counts),
             }
         )
-    if expected_energy:
-        missing_energy_diagnostic_scenes = [
-            scene
-            for scene in required_controlled_scenes
-            if int(energy_diagnostic_scene_counts.get(scene, 0)) <= 0
-        ]
-        if missing_energy_diagnostic_scenes:
-            mismatches.append(
-                {
-                    "missing_energy_diagnostic_scenes": (
-                        missing_energy_diagnostic_scenes
-                    ),
-                    "energy_diagnostic_scene_counts": dict(
-                        energy_diagnostic_scene_counts
-                    ),
-                    "expected": (
-                        "frozen-reference energy must be evaluable in every "
-                        "required controlled scene"
-                    ),
-                }
-            )
-        if abs(float(rho)) > 1e-12:
-            missing_energy_used_scenes = [
-                scene
-                for scene in required_controlled_scenes
-                if int(energy_used_scene_counts.get(scene, 0)) <= 0
-            ]
-            if missing_energy_used_scenes:
-                mismatches.append(
-                    {
-                        "missing_energy_guidance_scenes": (
-                            missing_energy_used_scenes
-                        ),
-                        "energy_used_scene_counts": dict(
-                            energy_used_scene_counts
-                        ),
-                        "expected": (
-                            "non-zero-rho Energy guidance must execute in every "
-                            "required controlled scene"
-                        ),
-                    }
-                )
     audit = {
         "passed": not mismatches,
         "trace_file_count": len(trace_paths),
         "trace_row_count": total_rows,
         "normal_anchor_cfg_used_rows": normal_anchor_used_rows,
         "empty_cfg_reference_used_rows": empty_reference_used_rows,
-        "preference_energy_guidance_used_rows": energy_used_rows,
-        "preference_energy_expected": expected_energy,
-        "energy_used_without_controlled_router_rows": (
-            energy_used_without_controlled_router_rows
-        ),
-        "energy_nonfinite_diagnostic_rows": energy_nonfinite_diagnostic_rows,
-        "energy_diagnostic_valid_rows": energy_diagnostic_valid_rows,
-        "energy_used_scene_counts": {
-            scene: int(energy_used_scene_counts.get(scene, 0))
-            for scene in CONTROLLED_RUNTIME_SCENES
-        },
-        "energy_diagnostic_scene_counts": {
-            scene: int(energy_diagnostic_scene_counts.get(scene, 0))
-            for scene in CONTROLLED_RUNTIME_SCENES
-        },
-        "energy_support_reason_counts_by_scene": {
-            scene: {
-                reason: int(count)
-                for reason, count in sorted(
-                    energy_support_reason_counts[scene].items()
-                )
-            }
-            for scene in CONTROLLED_RUNTIME_SCENES
-        },
-        "energy_speed_limit_source_counts_by_scene": {
-            scene: {
-                source: int(count)
-                for source, count in sorted(
-                    energy_speed_limit_source_counts[scene].items()
-                )
-            }
-            for scene in CONTROLLED_RUNTIME_SCENES
-        },
         "router_eligibility_contract": {
             "audit_window_steps": audit_window_steps,
             "min_router_active_steps": min_router_active_steps,
@@ -1063,10 +686,8 @@ def _audit_runtime_contract(
         "router_scenarios": router_segments,
         "mismatches": mismatches,
         "note": (
-            "CFG/Energy used-row counts may be below the total because style "
-            "routing or frozen-reference support is inactive outside eligible "
-            "car-follow/free-drive steps; rho=0 intentionally disables the "
-            "Energy gradient while retaining final Energy diagnostics"
+            "CFG used-row counts may be below the total because style routing "
+            "is inactive outside eligible car-follow/free-drive steps"
         ),
     }
     return audit
@@ -1137,19 +758,9 @@ def _db_count(path: Path) -> int:
     return sum(1 for _ in path.rglob("*.db"))
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as file_obj:
-        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _preflight(
     args: argparse.Namespace,
     checkpoints: Sequence[Path],
-    *,
-    energy_artifacts_required: bool,
 ) -> Dict[str, Any]:
     experiment_dir = Path(args.experiment_dir)
     args_file = experiment_dir / "args.json"
@@ -1193,11 +804,6 @@ def _preflight(
         )
     route_len_compatibility_fallback = "route_len" not in train_args
     required_artifact_keys = ("normalization_file_path",)
-    reported_artifact_keys = (
-        *required_artifact_keys,
-        "preference_energy_normalization_path",
-        "preference_energy_rank_model_path",
-    )
     missing_artifacts = []
     for key in required_artifact_keys:
         value = str(train_args.get(key, "")).strip()
@@ -1208,55 +814,6 @@ def _preflight(
             "Required training-time normalization artifacts are missing on this server: "
             + ", ".join(missing_artifacts)
         )
-    energy_artifacts: Dict[str, Dict[str, Any]] = {}
-    energy_artifact_specs = (
-        (
-            "preference_energy_normalization_path",
-            "preference_energy_normalization_path",
-        ),
-        (
-            "preference_energy_rank_model_path",
-            "preference_energy_rank_model_path",
-        ),
-    )
-    for option_attr, train_key in energy_artifact_specs:
-        explicit_value = str(getattr(args, option_attr, "")).strip()
-        train_value = str(train_args.get(train_key, "")).strip()
-        resolved_value = explicit_value or train_value
-        source = "command_line" if explicit_value else "checkpoint_args"
-        if energy_artifacts_required:
-            if not resolved_value:
-                raise ValueError(
-                    "full_energy requires "
-                    f"--{option_attr.replace('_', '-')} or args.json[{train_key!r}]"
-                )
-            resolved_path = Path(resolved_value).expanduser().resolve()
-            if not resolved_path.is_file():
-                raise FileNotFoundError(
-                    f"Missing frozen Energy artifact: {train_key}={resolved_path}"
-                )
-            try:
-                payload = json.loads(resolved_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"Invalid frozen Energy JSON artifact: {resolved_path}"
-                ) from exc
-            if not isinstance(payload, Mapping) or not payload:
-                raise ValueError(
-                    f"Frozen Energy artifact must be a non-empty JSON object: "
-                    f"{resolved_path}"
-                )
-            setattr(args, option_attr, str(resolved_path))
-            energy_artifacts[train_key] = {
-                "path": str(resolved_path),
-                "source": source,
-                "sha256": _sha256_file(resolved_path),
-            }
-        else:
-            energy_artifacts[train_key] = {
-                "path": resolved_value,
-                "source": source if resolved_value else "not_configured",
-            }
     style_condition_encoder = str(train_args.get("style_condition_encoder", ""))
     if style_condition_encoder not in {"axis_router_v1", "axis_router_v2_signed"}:
         raise ValueError(
@@ -1272,8 +829,6 @@ def _preflight(
             "signed_router_diffusion_gate_mode": "free_drive_terminal_only",
             "normal_anchor_cfg_enabled": False,
             "cfg_guidance_scale": 1.0,
-            "preference_energy_enabled": False,
-            "preference_energy_guidance_scale": 0.0,
         }
         mismatches = {
             key: {"expected": value, "actual": train_args.get(key)}
@@ -1342,10 +897,8 @@ def _preflight(
         "required_a3_8_terminal_executor": bool(
             args.require_a3_8_terminal_executor
         ),
-        "energy_artifacts_required": bool(energy_artifacts_required),
-        "energy_artifacts": energy_artifacts,
         "train_artifacts": {
-            key: train_args.get(key, "") for key in reported_artifact_keys
+            key: train_args.get(key, "") for key in required_artifact_keys
         },
     }
 
@@ -1370,13 +923,8 @@ def _command(
     )
     runtime_trace_dir = run_dir / "runtime_traces"
     variant_tag = _variant_tag(variant_contract)
-    guidance_stage = (
-        "stage_c"
-        if "full_energy" in _parse_variants(args.variants)
-        else "stage_b"
-    )
     experiment_uid = (
-        f"{args.challenge}/styleplanner_v6_{guidance_stage}/"
+        f"{args.challenge}/styleplanner_v6_stage_b/"
         f"{_checkpoint_tag(checkpoint)}/{variant_tag}/{_rho_tag(rho)}"
     )
     # NuPlan's metric aggregator selects metric files by looking for the
@@ -1410,14 +958,6 @@ def _command(
             "planner.style_planner.config.cfg_guidance_scale="
             f"{float(variant_contract['cfg_guidance_scale'])}"
         ),
-        (
-            "planner.style_planner.config.preference_energy_enabled="
-            f"{str(bool(variant_contract['preference_energy_enabled'])).lower()}"
-        ),
-        (
-            "planner.style_planner.config.preference_energy_guidance_scale="
-            f"{float(variant_contract['preference_energy_guidance_scale'])}"
-        ),
         "planner.style_planner.config.runtime_trace_export_enabled=true",
         f"scenario_builder={args.scenario_builder}",
         f"scenario_filter={args.scenario_filter}",
@@ -1433,60 +973,6 @@ def _command(
         f"seed={int(args.seed)}",
         f"hydra.searchpath={search_path}",
     ]
-    if guidance_stage == "stage_c":
-        command.extend(
-            [
-                (
-                    "+planner.style_planner.config."
-                    "preference_energy_normalization_path="
-                    f"{args.preference_energy_normalization_path}"
-                ),
-                (
-                    "+planner.style_planner.config."
-                    "preference_energy_rank_model_path="
-                    f"{args.preference_energy_rank_model_path}"
-                ),
-                (
-                    "+planner.style_planner.config.preference_energy_neighbours="
-                    f"{int(args.preference_energy_neighbours)}"
-                ),
-                (
-                    "+planner.style_planner.config."
-                    "preference_energy_min_shared_features="
-                    f"{int(args.preference_energy_min_shared_features)}"
-                ),
-                (
-                    "+planner.style_planner.config."
-                    "preference_energy_cdf_temperature="
-                    f"{float(args.preference_energy_cdf_temperature)}"
-                ),
-                (
-                    "+planner.style_planner.config."
-                    "preference_energy_preference_weight="
-                    f"{float(args.preference_energy_preference_weight)}"
-                ),
-                (
-                    "+planner.style_planner.config.preference_energy_safety_weight="
-                    f"{float(args.preference_energy_safety_weight)}"
-                ),
-                (
-                    "+planner.style_planner.config.preference_energy_grad_clip="
-                    f"{float(args.preference_energy_grad_clip)}"
-                ),
-                (
-                    "+planner.style_planner.config.preference_energy_t_min="
-                    f"{float(args.preference_energy_t_min)}"
-                ),
-                (
-                    "+planner.style_planner.config.preference_energy_t_max="
-                    f"{float(args.preference_energy_t_max)}"
-                ),
-                (
-                    "+planner.style_planner.config.free_drive_accel_support_mode="
-                    f"{args.free_drive_accel_support_mode}"
-                ),
-            ]
-        )
     if scenario_tokens:
         # Exact token cohorts must not be silently truncated by a scenario
         # filter preset's built-in debug limit.
@@ -1587,11 +1073,7 @@ def main() -> None:
     checkpoints = _resolve_checkpoints(args)
     rho_values = _parse_rhos(args.rho_values)
     variants = _parse_variants(args.variants)
-    _validate_guidance_controls(
-        args,
-        variants=variants,
-        rho_values=rho_values,
-    )
+    _validate_guidance_controls(args)
     log_names = _read_log_names(args.log_names_json)
     map_names = _parse_names(args.map_names)
     scenario_tokens = _read_scenario_tokens(args.scenario_tokens_json)
@@ -1606,31 +1088,6 @@ def main() -> None:
             "An exact --scenario-tokens-json cohort must not be combined with "
             "--scenario-types or --num-scenarios-per-type"
         )
-    if args.require_stage_c_energy_contract:
-        if len(checkpoints) != 1:
-            raise ValueError(
-                "Stage-C isolation requires exactly one checkpoint"
-            )
-        if not scenario_tokens:
-            raise ValueError(
-                "Stage-C isolation requires a fixed --scenario-tokens-json cohort"
-            )
-        if not args.require_router_eligible_scenarios:
-            raise ValueError(
-                "Stage-C isolation requires --require-router-eligible-scenarios"
-            )
-        if set(required_controlled_scenes) != set(
-            CONTROLLED_RUNTIME_SCENES
-        ):
-            raise ValueError(
-                "Stage-C isolation requires "
-                "--required-controlled-scenes "
-                + ",".join(CONTROLLED_RUNTIME_SCENES)
-            )
-        if not args.run_custom_metrics:
-            raise ValueError(
-                "Stage-C isolation requires --run-custom-metrics"
-            )
     if str(args.export_router_eligible_tokens_json).strip():
         if (
             len(checkpoints) != 1
@@ -1647,13 +1104,8 @@ def main() -> None:
                 "Router discovery must scan candidates, not reuse "
                 "--scenario-tokens-json"
             )
-    energy_artifacts_required = "full_energy" in variants
-    preflight = _preflight(
-        args,
-        checkpoints,
-        energy_artifacts_required=energy_artifacts_required,
-    )
-    guidance_stage = "stage_c" if energy_artifacts_required else "stage_b"
+    preflight = _preflight(args, checkpoints)
+    guidance_stage = "stage_b"
     run_tag = args.run_tag.strip() or dt.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
     suite_root = Path(args.output_root) / run_tag
     suite_root.mkdir(parents=True, exist_ok=True)
@@ -1664,9 +1116,6 @@ def main() -> None:
             variant_contract = _variant_contract(
                 variant,
                 normal_anchor_cfg_scale=args.normal_anchor_cfg_scale,
-                preference_energy_guidance_scale=(
-                    args.preference_energy_guidance_scale
-                ),
             )
             variant_tag = _variant_tag(variant_contract)
             for rho in rho_values:
@@ -1736,38 +1185,10 @@ def main() -> None:
         "stage": guidance_stage,
         "variants": variants,
         "normal_anchor_cfg_scale": float(args.normal_anchor_cfg_scale),
-        "preference_energy_guidance_scale": float(
-            args.preference_energy_guidance_scale
-        ),
-        "preference_energy_neighbours": int(
-            args.preference_energy_neighbours
-        ),
-        "preference_energy_min_shared_features": int(
-            args.preference_energy_min_shared_features
-        ),
-        "preference_energy_cdf_temperature": float(
-            args.preference_energy_cdf_temperature
-        ),
-        "preference_energy_preference_weight": float(
-            args.preference_energy_preference_weight
-        ),
-        "preference_energy_safety_weight": float(
-            args.preference_energy_safety_weight
-        ),
-        "preference_energy_grad_clip": float(
-            args.preference_energy_grad_clip
-        ),
-        "preference_energy_t_min": float(args.preference_energy_t_min),
-        "preference_energy_t_max": float(args.preference_energy_t_max),
-        "free_drive_accel_support_mode": str(
-            args.free_drive_accel_support_mode
-        ),
         "rho_is_only_external_style_control": True,
         "same_checkpoint_scenarios_seed_across_variants": True,
         "raw_step_export_enabled": False,
         "runtime_trace_export_enabled": True,
-        "rho_zero_energy_gradient_disabled": True,
-        "energy_must_not_run_outside_controlled_router": True,
     }
     manifest: Dict[str, Any] = {
         "artifact": "styleplanner_v6_closed_loop_suite",
