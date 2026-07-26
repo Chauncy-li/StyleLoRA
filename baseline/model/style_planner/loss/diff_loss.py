@@ -122,7 +122,19 @@ def diffusion_loss_func(
         "diffusion_time": t,
     }
 
-    _, decoder_output = model(merged_inputs)
+    encoder_output, decoder_output = model(merged_inputs)
+    # Reuse the exact same noised sample and frozen scene encoding for the
+    # optional semantic-normal-vs-empty consistency pass. These private fields
+    # are consumed only by the StylePlanner research loss and are not model
+    # outputs or checkpoint parameters.
+    decoder_output["_training_sampled_trajectories"] = xT.detach()
+    decoder_output["_training_diffusion_time"] = t.detach()
+    # Stage-A3.2 can reconstruct the same-noise x_t at a different, terminal
+    # diffusion time for the paired preference branch. This private clean
+    # trajectory is training-only and is never exported by the planner API.
+    decoder_output["_training_clean_trajectories"] = all_gt.detach()
+    if isinstance(encoder_output, dict) and "encoding" in encoder_output:
+        decoder_output["_training_context_encoding"] = encoder_output["encoding"].detach()
     prediction = _extract_diffusion_prediction(
         decoder_output,
         model_type=model_type,

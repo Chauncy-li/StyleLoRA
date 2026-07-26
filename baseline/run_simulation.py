@@ -37,9 +37,15 @@ SAVE_ROOT = NUPLAN_EXP_ROOT
 # 可选：
 # - diffusion_planner
 # - style_planner
+# - anchor_warm_start_style_planner
 # - wayformer
 PLANNER = "diffusion_planner"
-SUPPORTED_PLANNERS_FALLBACK = ["diffusion_planner", "style_planner", "wayformer"]
+SUPPORTED_PLANNERS_FALLBACK = [
+    "diffusion_planner",
+    "style_planner",
+    "anchor_warm_start_style_planner",
+    "wayformer",
+]
 
 # 在线日志后端（默认 swanlab）
 # - swanlab: 优先 swanlab，抑制 wandb 自动初始化

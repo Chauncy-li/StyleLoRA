@@ -61,11 +61,6 @@ from research.preference_execution.interaction_state.schema import AXIS_GATE_ORD
 from research.style_scene_split.defaults import DEFAULT_STYLE_SCENE_SPLIT_VAL_V2_DIR, PRIMARY_SCENE_BUCKETS
 from research.style_scene_split.schema_v2 import style_axis_names_for_scene
 
-DEFAULT_EXPERIMENT_DIR = (
-    "/mnt/mydata/lishangwen/Nuplan-Baseline-Record/"
-    "research_train/preference_conditioned_diffusion/"
-    "effective_preference_global_vec/2026_06_19-22_57_29"
-)
 CONDITION_SOURCE_TO_FIELD = {
     "effective": "effective_preference_global_vec",
     "safe": "safe_preference_global_vec",
@@ -107,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate preference-conditioned diffusion controllability on the validation split."
     )
-    parser.add_argument("--experiment_dir", default=DEFAULT_EXPERIMENT_DIR)
+    parser.add_argument("--experiment_dir", required=True)
     parser.add_argument("--checkpoint_path", default=None)
     parser.add_argument("--split_root", default=DEFAULT_STYLE_SCENE_SPLIT_VAL_V2_DIR)
     parser.add_argument("--cache_dir", default=str(DEFAULT_CACHE_TRAIN_VAL_DIR))

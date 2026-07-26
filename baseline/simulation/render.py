@@ -474,7 +474,7 @@ class NuplanScenarioRender:
 
         # 提取 XY
         if isinstance(planning_trajectory, list):  # List[InterpolatableState]
-            traj = np.array([s.rear_axle.array for s in planning_trajectory])
+            traj = np.array([s.rear_axle.array for s in planning_trajectory])[:, :2]
         else:
             traj = planning_trajectory[:, :2]  # ndarray
 
@@ -494,15 +494,71 @@ class NuplanScenarioRender:
 
     def _plot_prediction(self, ax, predictions):
         """
-        绘制多模态预测轨迹 (如果提供)
-        Predictions format: [K, T, 2] or similar
-        """
-        if predictions is None: return
+        Plot anchor-warm-start candidates in the ego-local frame.
 
-        # 简单的处理逻辑，假设 predictions 是 list of arrays
-        # 如果是 Tensor 需要先转 numpy
-        # 这里只做框架性支持
-        pass
+        ``predictions`` may be the debug dictionary produced by
+        ``AnchorWarmStartStylePlanner`` or a raw array shaped [K, T, 2].
+        """
+        if predictions is None:
+            return
+        if isinstance(predictions, dict):
+            trajectories = np.asarray(predictions.get("trajectories", []), dtype=np.float64)
+            anchors = np.asarray(predictions.get("anchors", []), dtype=np.float64)
+            labels = list(predictions.get("labels", []))
+            valid = list(predictions.get("valid", []))
+            scores = list(predictions.get("scores", []))
+            selected_index = int(predictions.get("selected_index", -1))
+            fallback_used = bool(predictions.get("fallback_used", False))
+        else:
+            trajectories = np.asarray(predictions, dtype=np.float64)
+            anchors = np.zeros((0,), dtype=np.float64)
+            labels = [f"candidate_{index}" for index in range(len(trajectories))]
+            valid = [True] * len(trajectories)
+            scores = [float("nan")] * len(trajectories)
+            selected_index = -1
+            fallback_used = False
+        if trajectories.ndim != 3 or trajectories.shape[-1] < 2:
+            return
+
+        color_by_intent = {
+            "keep": "#00bcd4",
+            "left": "#2ca02c",
+            "right": "#d627d9",
+        }
+        if anchors.ndim == 3 and anchors.shape[0] == trajectories.shape[0]:
+            for index, anchor in enumerate(anchors):
+                label = labels[index] if index < len(labels) else str(index)
+                color = color_by_intent.get(label, "#777777")
+                ax.plot(
+                    anchor[:, 0], anchor[:, 1], color=color, linewidth=1.2,
+                    linestyle=":", alpha=0.75, zorder=16,
+                )
+
+        for index, trajectory in enumerate(trajectories):
+            label = labels[index] if index < len(labels) else str(index)
+            is_valid = bool(valid[index]) if index < len(valid) else True
+            is_selected = index == selected_index
+            color = color_by_intent.get(label, "#555555") if is_valid else "#d62728"
+            score = scores[index] if index < len(scores) else float("nan")
+            score_text = f"{score:.2f}" if np.isfinite(score) else "invalid"
+            ax.plot(
+                trajectory[:, 0], trajectory[:, 1], color=color,
+                linewidth=4.0 if is_selected else 2.0,
+                linestyle="-" if is_valid else "--",
+                alpha=1.0 if is_selected else 0.75,
+                zorder=18 if is_selected else 17,
+            )
+            ax.text(
+                trajectory[-1, 0], trajectory[-1, 1], f"{label}: {score_text}",
+                color=color, fontsize=9,
+                fontweight="bold" if is_selected else "normal", zorder=22,
+            )
+        if fallback_used:
+            ax.text(
+                0.02, 0.97, "SAFETY FALLBACK: BRAKE", transform=ax.transAxes,
+                color="red", fontsize=12, fontweight="bold",
+                verticalalignment="top", zorder=30,
+            )
 
     def _plot_mission_goal(self, ax, mission_goal: StateSE2):
         if mission_goal is None: return

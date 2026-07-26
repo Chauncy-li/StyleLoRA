@@ -39,12 +39,15 @@ from baseline.core.register import Registry
 from baseline.model.diff_planner.diffusion_planner import Diffusion_Planner as BaseDiffusionPlannerModel
 from baseline.model.style_planner.diffusion_planner import Diffusion_Planner as StyleDiffusionPlannerModel
 from baseline.model.wayformer.wayf_planner import WayFormer
+from baseline.simulation.anchor_generator import MapAnchorGenerator
+from baseline.simulation.candidate_selector import SafetyCandidateSelector
 from research.preference_execution.runtime import (
     OnlinePreferenceConditioner,
     append_runtime_trace_csv,
     append_runtime_trace_jsonl,
     build_runtime_trace_row,
 )
+from research.continuous_style.runtime import ContinuousStyleRuntimeConditioner
 from baseline.simulation.render import NuplanScenarioRender
 from baseline.utils.config import Config
 
@@ -61,12 +64,32 @@ def load_checkpoint_safely(model, ckpt_path: str, device: str):
     elif isinstance(state_dict, dict) and "model" in state_dict:
         state_dict = state_dict["model"]
 
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Checkpoint state must be a dictionary, got {type(state_dict)!r}")
     ckpt_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model_state_dict = model.state_dict()
+    matched_numel = sum(
+        value.numel()
+        for key, value in model_state_dict.items()
+        if key in ckpt_state_dict and tuple(ckpt_state_dict[key].shape) == tuple(value.shape)
+    )
+    total_numel = sum(value.numel() for value in model_state_dict.values())
+    coverage = matched_numel / max(total_numel, 1)
+    print(f"Checkpoint parameter coverage: {coverage:.2%}")
+    minimum_coverage = float(getattr(model, "_minimum_checkpoint_coverage", 0.0))
+    if coverage < minimum_coverage:
+        raise RuntimeError(
+            f"Checkpoint/model compatibility check failed: {coverage:.2%} < "
+            f"required {minimum_coverage:.2%}. Check args.json and checkpoint pairing."
+        )
     missing, unexpected = model.load_state_dict(ckpt_state_dict, strict=False)
     if missing:
-        print(f"Warning: missing keys in checkpoint: {len(missing)}")
+        print(f"Warning: missing keys in checkpoint: {len(missing)}; first keys: {missing[:10]}")
     if unexpected:
-        print(f"Warning: unexpected keys in checkpoint: {len(unexpected)}")
+        print(
+            f"Warning: unexpected keys in checkpoint: {len(unexpected)}; "
+            f"first keys: {unexpected[:10]}"
+        )
     return model
 
 
@@ -97,6 +120,9 @@ class DiffusionPlanner(AbstractPlanner):
         self._runtime_trace_export_enabled = bool(getattr(config, "runtime_trace_export_enabled", True))
         self._runtime_preference_trace_path: Optional[str] = None
         self._runtime_preference_csv_path: Optional[str] = None
+        # Cleanup-owned fields must exist even if model/data construction fails.
+        self.video_writer = None
+        self.renderer: Optional[NuplanScenarioRender] = None
 
         self._planner = self.planner_model_cls(config)
         self.data_processor = DataProcessor(config)
@@ -104,8 +130,6 @@ class DiffusionPlanner(AbstractPlanner):
 
         # 渲染相关
         self.render_save_dir = getattr(config, "render_save_dir", None)
-        self.renderer: Optional[NuplanScenarioRender] = None
-        self.video_writer = None
         if self.render_save_dir:
             os.makedirs(self.render_save_dir, exist_ok=True)
             self.renderer = NuplanScenarioRender(future_horizon=self._future_horizon)
@@ -118,13 +142,25 @@ class DiffusionPlanner(AbstractPlanner):
             self.raw_data_save_dir = default_raw_dir
         else:
             self.raw_data_save_dir = str(raw_data_cfg)
+        runtime_trace_cfg = getattr(config, "runtime_trace_save_dir", None)
+        if runtime_trace_cfg is None or str(runtime_trace_cfg).strip() == "":
+            self.runtime_trace_save_dir = self.raw_data_save_dir
+        else:
+            self.runtime_trace_save_dir = str(runtime_trace_cfg)
         self._scenario_raw_dir: Optional[str] = None
         self._raw_trace_path: Optional[str] = None
         self._scenario_index = 0
         self._step_export_index = 0
+        self._runtime_trace_step_index = 0
         if self.raw_data_save_dir:
             os.makedirs(self.raw_data_save_dir, exist_ok=True)
             print(f"Raw step export enabled. Output dir: {self.raw_data_save_dir}")
+        if self._runtime_trace_export_enabled and self.runtime_trace_save_dir:
+            os.makedirs(self.runtime_trace_save_dir, exist_ok=True)
+            print(
+                "Runtime preference trace export enabled. Output dir: "
+                f"{self.runtime_trace_save_dir}"
+            )
 
     def name(self) -> str:
         return self.planner_name
@@ -147,21 +183,31 @@ class DiffusionPlanner(AbstractPlanner):
         # 每个 scenario 初始化时重置导出状态
         self._scenario_index += 1
         self._step_export_index = 0
+        self._runtime_trace_step_index = 0
         self._last_runtime_preference_debug = None
         if self.raw_data_save_dir:
             scenario_dir = os.path.join(self.raw_data_save_dir, f"scenario_{self._scenario_index:06d}")
             os.makedirs(scenario_dir, exist_ok=True)
             self._scenario_raw_dir = scenario_dir
             self._raw_trace_path = os.path.join(scenario_dir, "step_trace.jsonl")
-            if self._runtime_trace_export_enabled:
-                self._runtime_preference_trace_path = os.path.join(scenario_dir, "runtime_preference_trace.jsonl")
-                self._runtime_preference_csv_path = os.path.join(scenario_dir, "runtime_preference_trace.csv")
-            else:
-                self._runtime_preference_trace_path = None
-                self._runtime_preference_csv_path = None
         else:
             self._scenario_raw_dir = None
             self._raw_trace_path = None
+        if self._runtime_trace_export_enabled and self.runtime_trace_save_dir:
+            runtime_scenario_dir = os.path.join(
+                self.runtime_trace_save_dir,
+                f"scenario_{self._scenario_index:06d}",
+            )
+            os.makedirs(runtime_scenario_dir, exist_ok=True)
+            self._runtime_preference_trace_path = os.path.join(
+                runtime_scenario_dir,
+                "runtime_preference_trace.jsonl",
+            )
+            self._runtime_preference_csv_path = os.path.join(
+                runtime_scenario_dir,
+                "runtime_preference_trace.csv",
+            )
+        else:
             self._runtime_preference_trace_path = None
             self._runtime_preference_csv_path = None
 
@@ -211,6 +257,7 @@ class DiffusionPlanner(AbstractPlanner):
             self._render_and_save(current_input, trajectory)
         if self._scenario_raw_dir is not None:
             self._export_step_bundle(current_input, raw_inputs, outputs)
+        self._export_runtime_preference_trace(current_input)
 
         return trajectory
 
@@ -223,6 +270,33 @@ class DiffusionPlanner(AbstractPlanner):
 
     def _update_runtime_preference_debug(self, outputs: Dict[str, torch.Tensor]) -> None:
         return
+
+    def _export_runtime_preference_trace(
+        self,
+        current_input: PlannerInput,
+    ) -> None:
+        if (
+            self._last_runtime_preference_debug is None
+            or self._runtime_preference_trace_path is None
+            or self._runtime_preference_csv_path is None
+        ):
+            return
+        step_index = self._runtime_trace_step_index
+        self._runtime_trace_step_index += 1
+        runtime_trace_row = build_runtime_trace_row(
+            step_index=step_index,
+            iteration_index=int(current_input.iteration.index),
+            time_us=int(current_input.history.ego_states[-1].time_point.time_us),
+            debug=self._last_runtime_preference_debug,
+        )
+        append_runtime_trace_jsonl(
+            self._runtime_preference_trace_path,
+            runtime_trace_row,
+        )
+        append_runtime_trace_csv(
+            self._runtime_preference_csv_path,
+            runtime_trace_row,
+        )
 
     def _render_and_save(self, current_input: PlannerInput, trajectory: InterpolatedTrajectory) -> None:
         try:
@@ -238,6 +312,7 @@ class DiffusionPlanner(AbstractPlanner):
                 current_input=current_input,
                 initialization=self._initialization,
                 planning_trajectory=planning_trajectory,
+                predictions=getattr(self, "_last_candidate_render", None),
             )
             if img_rgb is not None and self.video_writer is not None:
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
@@ -278,6 +353,31 @@ class DiffusionPlanner(AbstractPlanner):
                 return np.zeros((0,), dtype=np.float32)
             return value[0].detach().cpu().numpy().astype(np.float32)
 
+        candidate_prediction = outputs.get("candidate_prediction")
+        candidate_prediction_np = (
+            candidate_prediction.detach().cpu().numpy().astype(np.float32)
+            if torch.is_tensor(candidate_prediction)
+            else np.zeros((0,), dtype=np.float32)
+        )
+        candidate_scores = outputs.get("candidate_scores")
+        candidate_scores_np = (
+            candidate_scores.detach().cpu().numpy().astype(np.float32)
+            if torch.is_tensor(candidate_scores)
+            else np.zeros((0,), dtype=np.float32)
+        )
+        candidate_valid = outputs.get("candidate_valid_mask")
+        candidate_valid_np = (
+            candidate_valid.detach().cpu().numpy().astype(np.bool_)
+            if torch.is_tensor(candidate_valid)
+            else np.zeros((0,), dtype=np.bool_)
+        )
+        candidate_anchor = outputs.get("candidate_anchor")
+        candidate_anchor_np = (
+            candidate_anchor.detach().cpu().numpy().astype(np.float32)
+            if torch.is_tensor(candidate_anchor)
+            else np.zeros((0,), dtype=np.float32)
+        )
+
         np.savez_compressed(
             file_path,
             step_index=np.array(step_index, dtype=np.int64),
@@ -294,6 +394,17 @@ class DiffusionPlanner(AbstractPlanner):
             generated_prediction=prediction_np,
             generated_ego_future=prediction_np[0] if prediction_np.shape[0] > 0 else np.zeros((0, 4), dtype=np.float32),
             generated_neighbor_future=prediction_np[1:] if prediction_np.shape[0] > 1 else np.zeros((0, 0, 4), dtype=np.float32),
+            candidate_prediction=candidate_prediction_np,
+            candidate_anchor=candidate_anchor_np,
+            candidate_scores=candidate_scores_np,
+            candidate_valid_mask=candidate_valid_np,
+            candidate_intents=np.asarray(outputs.get("candidate_intents", ()), dtype=str),
+            selected_candidate_index=np.asarray(
+                int(outputs.get("selected_candidate_index", -1)), dtype=np.int64
+            ),
+            safety_fallback_used=np.asarray(
+                bool(outputs.get("safety_fallback_used", False)), dtype=np.bool_
+            ),
         )
 
         if self._raw_trace_path is not None:
@@ -305,21 +416,44 @@ class DiffusionPlanner(AbstractPlanner):
             }
             if self._last_runtime_preference_debug is not None:
                 row["runtime_preference"] = self._last_runtime_preference_debug
-                if self._runtime_preference_trace_path is not None and self._runtime_preference_csv_path is not None:
-                    runtime_trace_row = build_runtime_trace_row(
-                        step_index=step_index,
-                        iteration_index=iteration_index,
-                        time_us=time_us,
-                        debug=self._last_runtime_preference_debug,
-                    )
-                    append_runtime_trace_jsonl(self._runtime_preference_trace_path, runtime_trace_row)
-                    append_runtime_trace_csv(self._runtime_preference_csv_path, runtime_trace_row)
+            evaluations = outputs.get("candidate_evaluations")
+            if evaluations is not None:
+                def _finite_or_none(value: object):
+                    number = float(value)
+                    return number if np.isfinite(number) else None
+
+                row["anchor_warm_start"] = {
+                    "intents": [str(item) for item in outputs.get("candidate_intents", ())],
+                    "selected_candidate_index": int(
+                        outputs.get("selected_candidate_index", -1)
+                    ),
+                    "safety_fallback_used": bool(
+                        outputs.get("safety_fallback_used", False)
+                    ),
+                    "unavailable_reasons": dict(
+                        outputs.get("anchor_unavailable_reasons", {})
+                    ),
+                    "evaluations": [
+                        {
+                            "intent": str(item.intent),
+                            "hard_valid": bool(item.hard_valid),
+                            "score": _finite_or_none(item.score),
+                            "failure_reasons": list(item.failure_reasons),
+                            "metrics": {
+                                str(key): _finite_or_none(value)
+                                for key, value in item.metrics.items()
+                            },
+                        }
+                        for item in evaluations
+                    ],
+                }
             with open(self._raw_trace_path, "a", encoding="utf-8") as file_obj:
                 file_obj.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def __del__(self):
-        if self.video_writer is not None:
-            self.video_writer.release()
+        video_writer = getattr(self, "video_writer", None)
+        if video_writer is not None:
+            video_writer.release()
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -649,20 +783,88 @@ class StylePlanner(DiffusionPlanner):
             device=device,
         )
         runtime_preference_enabled = bool(getattr(config, "runtime_preference_enabled", True))
-        self._online_preference_conditioner = (
-            OnlinePreferenceConditioner(config) if runtime_preference_enabled else None
-        )
+        self._runtime_style_mode = str(getattr(config, "runtime_style_mode", "legacy_preference_execution"))
+        style_condition_encoder = str(getattr(config, "style_condition_encoder", "mlp"))
+        v6_style_condition_encoders = {"axis_router_v1", "axis_router_v2_signed"}
+        if (
+            runtime_preference_enabled
+            and style_condition_encoder in v6_style_condition_encoders
+            and self._runtime_style_mode != "continuous_v6"
+        ):
+            raise ValueError(
+                f"A V6 {style_condition_encoder} checkpoint requires "
+                "runtime_style_mode='continuous_v6'. The legacy conditioner "
+                "does not implement the 12D V6 condition contract."
+            )
+        if not runtime_preference_enabled:
+            self._online_preference_conditioner = None
+        elif self._runtime_style_mode == "continuous_v6":
+            self._online_preference_conditioner = ContinuousStyleRuntimeConditioner(config)
+        elif self._runtime_style_mode == "legacy_preference_execution":
+            self._online_preference_conditioner = OnlinePreferenceConditioner(config)
+        else:
+            raise ValueError(
+                "runtime_style_mode must be 'legacy_preference_execution' or 'continuous_v6', got "
+                f"{self._runtime_style_mode!r}"
+            )
 
-    def set_runtime_preference(self, style_label: str | None = None, intensity: float | None = None) -> None:
+    def set_runtime_preference(
+        self,
+        style_label: str | None = None,
+        intensity: float | None = None,
+        rho: float | None = None,
+    ) -> None:
         if self._online_preference_conditioner is None:
             raise RuntimeError("runtime preference control is disabled for this StylePlanner instance.")
-        self._online_preference_conditioner.set_command(style_label=style_label, intensity=intensity)
+        if self._runtime_style_mode == "continuous_v6":
+            if style_label is not None or intensity is not None:
+                raise ValueError("continuous_v6 accepts only rho; style_label/intensity belong to legacy_preference_execution.")
+            self._online_preference_conditioner.set_command(rho=rho)
+        else:
+            if rho is not None:
+                raise ValueError("rho is supported only when runtime_style_mode='continuous_v6'.")
+            self._online_preference_conditioner.set_command(style_label=style_label, intensity=intensity)
+
+    def set_runtime_lane_change_context(
+        self,
+        *,
+        lane_change_intent: bool | None = None,
+        intent_available: bool | None = None,
+        target_lane_available: bool | None = None,
+        target_lane_interaction_observable: bool | None = None,
+    ) -> None:
+        """Supply explicit causal route/target-lane signals to V6 at runtime."""
+
+        if self._runtime_style_mode != "continuous_v6" or self._online_preference_conditioner is None:
+            raise RuntimeError("lane-change causal context is available only for enabled continuous_v6 runtime control.")
+        self._online_preference_conditioner.set_route_context(
+            lane_change_intent=lane_change_intent,
+            intent_available=intent_available,
+            target_lane_available=target_lane_available,
+            target_lane_interaction_observable=target_lane_interaction_observable,
+        )
 
     def current_runtime_preference(self) -> Dict[str, object]:
         if self._online_preference_conditioner is None:
             return {"enabled": False}
+        if self._runtime_style_mode == "continuous_v6":
+            return {
+                "enabled": True,
+                "runtime_style_mode": "continuous_v6",
+                "rho": self._online_preference_conditioner.rho,
+                "normal_anchor_cfg_enabled": (
+                    self._online_preference_conditioner.normal_anchor_cfg_enabled
+                ),
+                "cfg_guidance_scale": (
+                    self._online_preference_conditioner.cfg_guidance_scale
+                ),
+                "preference_energy_guidance_scale": (
+                    self._online_preference_conditioner.preference_energy_guidance_scale
+                ),
+            }
         return {
             "enabled": True,
+            "runtime_style_mode": "legacy_preference_execution",
             "style_label": self._online_preference_conditioner.style_label,
             "style_intensity": self._online_preference_conditioner.style_intensity,
             "stats_path": self._online_preference_conditioner.stats_path,
@@ -691,14 +893,207 @@ class StylePlanner(DiffusionPlanner):
             "temporal_far_gate",
             "temporal_near_condition",
             "temporal_far_condition",
+            "axis_router_gate",
+            "axis_router_learned_gate",
+            "axis_router_availability",
+            "normal_anchor_cfg_used",
+            "empty_cfg_reference_used",
+            "preference_energy_guidance_used",
+            "preference_energy",
+            "preference_axis_energy",
+            "preference_safety_energy",
+            "preference_command_strength",
+            "preference_generated_axis_percentile",
+            "preference_generated_raw_axis",
+            "preference_generated_axis_valid_mask",
+            "preference_target_axis_percentile",
+            "preference_energy_support_reason_code",
+            "preference_energy_shared_condition_count",
+            "preference_energy_speed_limit_source_code",
+            "preference_energy_speed_limit_valid",
+            "preference_energy_route_curvature_valid",
+            "preference_energy_free_drive_clear",
+            "preference_energy_active_traffic_control",
+            "preference_energy_reference_valid_axis_mask",
         )
         for key in temporal_keys:
             value = outputs.get(key)
-            if value is None or not torch.is_tensor(value) or value.ndim < 2:
+            if value is None or not torch.is_tensor(value):
                 continue
-            self._last_runtime_preference_debug[key] = [
-                float(item) for item in value[0].detach().cpu().reshape(-1).tolist()
-            ]
+            detached = value.detach().cpu()
+            caster = bool if detached.dtype == torch.bool else float
+            if detached.ndim == 0:
+                self._last_runtime_preference_debug[key] = caster(detached)
+            else:
+                self._last_runtime_preference_debug[key] = [
+                    caster(item) for item in detached[0].reshape(-1).tolist()
+                ]
+
+
+class AnchorWarmStartStylePlanner(StylePlanner):
+    """Closed-loop style planner with map anchors and safety-first candidate selection.
+
+    This planner intentionally shares the exact ``StyleDiffusionPlannerModel``
+    parameterization with :class:`StylePlanner`, so a checkpoint trained by the
+    original ``diff_planner`` can be loaded without adding or reshaping weights.
+    """
+
+    planner_name = "anchor_warm_start_style_planner"
+
+    def __init__(
+        self,
+        config: Config,
+        ckpt_path: str,
+        past_trajectory_sampling: TrajectorySampling,
+        future_trajectory_sampling: TrajectorySampling,
+        enable_ema: bool = True,
+        device: str = "cpu",
+    ):
+        super().__init__(
+            config=config,
+            ckpt_path=ckpt_path,
+            past_trajectory_sampling=past_trajectory_sampling,
+            future_trajectory_sampling=future_trajectory_sampling,
+            enable_ema=enable_ema,
+            device=device,
+        )
+        # A legacy diff_planner checkpoint should cover essentially every
+        # parameter because warm-start adds no trainable modules.
+        self._planner._minimum_checkpoint_coverage = 0.98
+        self._anchor_generator = MapAnchorGenerator(
+            config,
+            horizon_s=self._future_horizon,
+            step_interval=self._step_interval,
+        )
+        model_future_len = int(getattr(config, "future_len"))
+        if self._anchor_generator.future_len != model_future_len:
+            raise ValueError(
+                "Simulation sampling and checkpoint future_len disagree: "
+                f"{self._anchor_generator.future_len} vs {model_future_len}"
+            )
+        self._candidate_selector = SafetyCandidateSelector(
+            config,
+            step_interval=self._step_interval,
+        )
+        self._warm_start_t = float(getattr(config, "warm_start_t", 0.30))
+        self._warm_start_shared_noise = bool(getattr(config, "warm_start_shared_noise", True))
+        if not 1e-3 < self._warm_start_t <= 1.0:
+            raise ValueError(f"warm_start_t must be in (1e-3, 1], got {self._warm_start_t}")
+        self._last_candidate_render = None
+
+    def initialize(self, initialization: PlannerInitialization) -> None:
+        self._last_candidate_render = None
+        super().initialize(initialization)
+
+    @staticmethod
+    def _repeat_batch_inputs(inputs: Dict[str, object], repeats: int) -> Dict[str, object]:
+        if repeats <= 0:
+            raise ValueError("repeats must be positive")
+        batch_size = None
+        for value in inputs.values():
+            if torch.is_tensor(value) and value.ndim > 0:
+                batch_size = int(value.shape[0])
+                break
+        if batch_size is None:
+            raise ValueError("No batched tensor found in planner inputs")
+        repeated: Dict[str, object] = {}
+        for key, value in inputs.items():
+            if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+                repeated[key] = value.repeat_interleave(repeats, dim=0)
+            else:
+                repeated[key] = value
+        return repeated
+
+    def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
+        with torch.no_grad():
+            self._last_runtime_preference_debug = None
+            ego_state = current_input.history.ego_states[-1]
+            raw_inputs = self.planner_input_to_model_inputs(current_input)
+            bundle = self._anchor_generator.build(
+                ego_state,
+                self._map_api,
+                self._route_roadblock_ids,
+            )
+            anchors = list(bundle.candidates)
+            if not anchors:
+                raise RuntimeError("MapAnchorGenerator must return at least the keep/fallback anchor")
+
+            normalized_inputs = self.observation_normalizer(raw_inputs)
+            conditioned_inputs = self._augment_model_inputs(raw_inputs, normalized_inputs)
+            model_inputs = self._repeat_batch_inputs(conditioned_inputs, len(anchors))
+            model_inputs["warm_start_enabled"] = True
+            model_inputs["warm_start_t"] = self._warm_start_t
+            model_inputs["warm_start_dt"] = self._step_interval
+            model_inputs["warm_start_shared_noise"] = self._warm_start_shared_noise
+            model_inputs["warm_start_neighbor_past_raw"] = raw_inputs[
+                "neighbor_agents_past"
+            ].repeat_interleave(len(anchors), dim=0)
+            model_inputs["warm_start_ego_anchor"] = torch.as_tensor(
+                np.stack([anchor.ego_future_local for anchor in anchors], axis=0),
+                dtype=raw_inputs["ego_current_state"].dtype,
+                device=self._device,
+            )
+
+            _, model_outputs = self._planner(model_inputs)
+            candidate_prediction = model_outputs["prediction"]  # [K, P, T, 4]
+            selection = self._candidate_selector.select(
+                candidate_prediction,
+                anchors,
+                bundle,
+                raw_inputs,
+                ego_state,
+                self._map_api,
+            )
+            evaluations = selection.evaluations
+            candidate_scores = torch.as_tensor(
+                [evaluation.score for evaluation in evaluations],
+                dtype=candidate_prediction.dtype,
+                device=candidate_prediction.device,
+            )
+            candidate_valid = torch.as_tensor(
+                [evaluation.hard_valid for evaluation in evaluations],
+                dtype=torch.bool,
+                device=candidate_prediction.device,
+            )
+            outputs = dict(model_outputs)
+            outputs.update(
+                {
+                    "prediction": selection.selected_prediction.unsqueeze(0),
+                    "candidate_prediction": candidate_prediction,
+                    "candidate_anchor": torch.as_tensor(
+                        np.stack([anchor.ego_future_local for anchor in anchors], axis=0),
+                        dtype=candidate_prediction.dtype,
+                        device=candidate_prediction.device,
+                    ),
+                    "candidate_scores": candidate_scores,
+                    "candidate_valid_mask": candidate_valid,
+                    "candidate_intents": tuple(anchor.intent for anchor in anchors),
+                    "candidate_evaluations": evaluations,
+                    "anchor_unavailable_reasons": dict(bundle.unavailable_reasons),
+                    "selected_candidate_index": selection.selected_candidate_index,
+                    "safety_fallback_used": selection.used_fallback,
+                }
+            )
+            self._update_runtime_preference_debug(outputs)
+            self._last_candidate_render = {
+                "trajectories": candidate_prediction[:, 0, :, :2].detach().cpu().numpy(),
+                "anchors": np.stack([anchor.ego_future_local[:, :2] for anchor in anchors], axis=0),
+                "labels": [anchor.intent for anchor in anchors],
+                "valid": [evaluation.hard_valid for evaluation in evaluations],
+                "scores": [evaluation.score for evaluation in evaluations],
+                "selected_index": selection.selected_candidate_index,
+                "fallback_used": selection.used_fallback,
+            }
+
+        trajectory = InterpolatedTrajectory(
+            trajectory=self.outputs_to_trajectory(outputs, current_input.history.ego_states)
+        )
+        if self.renderer is not None:
+            self._render_and_save(current_input, trajectory)
+        if self._scenario_raw_dir is not None:
+            self._export_step_bundle(current_input, raw_inputs, outputs)
+        self._export_runtime_preference_trace(current_input)
+        return trajectory
 
 
 def register_simulation_planners() -> None:
@@ -707,6 +1102,9 @@ def register_simulation_planners() -> None:
         return
     SIMULATION_PLANNER_REGISTRY.register("diffusion_planner", DiffusionPlanner)
     SIMULATION_PLANNER_REGISTRY.register("style_planner", StylePlanner)
+    SIMULATION_PLANNER_REGISTRY.register(
+        "anchor_warm_start_style_planner", AnchorWarmStartStylePlanner
+    )
     SIMULATION_PLANNER_REGISTRY.register("wayformer", Wayformer)
 
 

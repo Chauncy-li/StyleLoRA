@@ -7,7 +7,12 @@ __pycache__/
 *.egg-info/
 ckpt/
 image*
+!nuplan-devkit/nuplan/database/utils/image.py
 exp/
 cache/
 checkpoints/
-results_l/
+results/
+results_test/
+result_l1/
+_disposable_diagnostics/
+tmp/

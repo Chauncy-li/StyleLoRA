@@ -17,6 +17,106 @@ from baseline.model.style_planner.library.sde import SDE, VPSDE_linear
 from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
 from baseline.model.style_planner.layer.mixer import MixerBlock
 from baseline.model.style_planner.layer.dit import TimestepEmbedder, DiTBlock, FinalLayer
+from baseline.model.style_planner.layer.preference_axis_router import (
+    AxisTemporalKinematicEgoSignedOutputAdapter,
+    EgoSignedOutputAdapter,
+    KinematicEgoSignedOutputAdapter,
+    PreferenceAxisRouter,
+    SignedPreferenceAxisRouter,
+)
+from baseline.model.style_planner.guidance.preference_energy import ConditionalPreferenceEnergy
+
+
+SIGNED_ROUTER_DIFFUSION_GATE_MODES = (
+    "all_steps",
+    "free_drive_terminal_only",
+)
+
+
+def _signed_router_diffusion_gate(
+    diffusion_time: torch.Tensor,
+    free_drive_mask: torch.Tensor,
+    *,
+    mode: str,
+    terminal_t_max: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the per-sample A3.8 residual gate and terminal-active mask.
+
+    ``free_drive_terminal_only`` suppresses the free-drive residual at every
+    denoiser call except the final DPM denoise-to-zero call.  Non-free-drive
+    samples deliberately retain the historical all-step residual path.
+    """
+
+    gate_mode = str(mode)
+    if gate_mode not in SIGNED_ROUTER_DIFFUSION_GATE_MODES:
+        raise ValueError(
+            "signed_router_diffusion_gate_mode must be 'all_steps' or "
+            f"'free_drive_terminal_only', got {gate_mode!r}"
+        )
+    free_drive = torch.as_tensor(
+        free_drive_mask,
+        device=diffusion_time.device,
+        dtype=torch.bool,
+    ).reshape(-1)
+    time = torch.as_tensor(
+        diffusion_time,
+        device=free_drive.device,
+    ).reshape(-1)
+    if time.numel() == 1 and free_drive.numel() != 1:
+        time = time.expand(free_drive.numel())
+    if time.numel() != free_drive.numel():
+        raise ValueError(
+            "diffusion time and free-drive mask must have the same batch size"
+        )
+
+    if gate_mode == "all_steps":
+        return torch.ones_like(time, dtype=dtype), torch.zeros_like(
+            free_drive,
+            dtype=torch.bool,
+        )
+    threshold = float(terminal_t_max)
+    if threshold <= 0.0:
+        raise ValueError("signed_router_terminal_t_max must be positive")
+    terminal_active = time <= threshold
+    sample_active = (~free_drive) | terminal_active
+    return sample_active.to(dtype=dtype), terminal_active
+
+
+def selftest_signed_router_diffusion_gate() -> dict[str, bool]:
+    """Check A3.8 terminal execution and the legacy rollback path."""
+
+    diffusion_time = torch.tensor([0.8, 0.001, 0.8, 0.0011])
+    free_drive = torch.tensor([True, True, False, True])
+    all_steps, _ = _signed_router_diffusion_gate(
+        diffusion_time,
+        free_drive,
+        mode="all_steps",
+        terminal_t_max=0.0011,
+        dtype=torch.float32,
+    )
+    terminal_only, terminal_active = _signed_router_diffusion_gate(
+        diffusion_time,
+        free_drive,
+        mode="free_drive_terminal_only",
+        terminal_t_max=0.0011,
+        dtype=torch.float32,
+    )
+    return {
+        "all_steps_is_exact_legacy_path": bool(
+            torch.equal(all_steps, torch.ones_like(all_steps))
+        ),
+        "free_drive_uses_only_terminal_call": bool(
+            torch.equal(
+                terminal_only,
+                torch.tensor([0.0, 1.0, 1.0, 1.0]),
+            )
+        ),
+        "car_follow_retains_all_steps": bool(terminal_only[2].item() == 1.0),
+        "terminal_boundary_is_inclusive": bool(
+            terminal_active.tolist() == [False, True, False, True]
+        ),
+    }
 
 
 class Decoder(nn.Module):
@@ -70,6 +170,12 @@ class Decoder(nn.Module):
         self._predicted_neighbor_num = config.predicted_neighbor_num
         self._future_len = config.future_len
         self._sde = VPSDE_linear()
+        self._diffusion_steps = int(getattr(config, "diffusion_steps", 10))
+        self._warm_start_diffusion_steps = int(
+            getattr(config, "warm_start_diffusion_steps", self._diffusion_steps)
+        )
+        if self._warm_start_diffusion_steps < 2:
+            raise ValueError("warm_start_diffusion_steps must be at least 2 for second-order DPM-Solver")
         self._style_value_dim = int(getattr(config, "style_value_dim", 0))
         self._global_style_condition_dim = int(
             getattr(config, "global_style_condition_dim", self._style_value_dim)
@@ -78,6 +184,27 @@ class Decoder(nn.Module):
         self._phase_style_num_phases = int(getattr(config, "phase_style_num_phases", 0))
         self._phase_style_flat_dim = int(getattr(config, "phase_style_flat_dim", 0))
         self._cfg_guidance_scale = float(getattr(config, "cfg_guidance_scale", 1.0))
+        self._normal_anchor_cfg_enabled = bool(
+            getattr(config, "normal_anchor_cfg_enabled", False)
+        )
+        self._style_condition_encoder = str(
+            getattr(config, "style_condition_encoder", "mlp")
+        )
+        self._axis_router_token_dim = int(
+            getattr(config, "axis_router_token_dim", 64)
+        )
+        self._signed_router_injection_mode = str(
+            getattr(config, "signed_router_injection_mode", "global_adaln")
+        )
+        self._signed_router_diffusion_gate_mode = str(
+            getattr(config, "signed_router_diffusion_gate_mode", "all_steps")
+        )
+        self._signed_router_terminal_t_max = float(
+            getattr(config, "signed_router_terminal_t_max", 0.0011)
+        )
+        self._kinematic_ego_basis_count = int(
+            getattr(config, "kinematic_ego_basis_count", 6)
+        )
         self._use_style_condition = bool(getattr(config, "use_style_condition", self._style_value_dim > 0))
         self._use_phase_style_condition = bool(
             getattr(config, "use_phase_style_condition", self._phase_style_flat_dim > 0)
@@ -103,10 +230,68 @@ class Decoder(nn.Module):
             use_phase_style_condition=self._use_phase_style_condition,
             use_temporal_style_gate=self._use_temporal_style_gate,
             temporal_gate_hidden_dim=self._temporal_gate_hidden_dim,
+            style_condition_encoder=self._style_condition_encoder,
+            axis_router_token_dim=self._axis_router_token_dim,
+            signed_router_injection_mode=self._signed_router_injection_mode,
+            signed_router_diffusion_gate_mode=(
+                self._signed_router_diffusion_gate_mode
+            ),
+            signed_router_terminal_t_max=self._signed_router_terminal_t_max,
+            kinematic_ego_basis_count=self._kinematic_ego_basis_count,
         )
         
         self._state_normalizer: StateNormalizer = config.state_normalizer
         self._observation_normalizer: ObservationNormalizer = config.observation_normalizer
+        self._preference_energy_enabled = bool(
+            getattr(config, "preference_energy_enabled", False)
+        )
+        self._preference_energy_guidance_scale = float(
+            getattr(config, "preference_energy_guidance_scale", 0.0)
+        )
+        self._preference_energy_grad_clip = float(
+            getattr(config, "preference_energy_grad_clip", 0.5)
+        )
+        self._preference_energy_t_min = float(
+            getattr(config, "preference_energy_t_min", 0.01)
+        )
+        self._preference_energy_t_max = float(
+            getattr(config, "preference_energy_t_max", 0.55)
+        )
+        if self._preference_energy_enabled:
+            if self.dit.model_type != "x_start":
+                raise ValueError("preference energy requires diffusion_model_type='x_start'")
+            self.preference_energy = ConditionalPreferenceEnergy(
+                normalization_path=str(
+                    getattr(config, "preference_energy_normalization_path", "")
+                ),
+                conditional_rank_model_path=str(
+                    getattr(config, "preference_energy_rank_model_path", "")
+                ),
+                state_normalizer=self._state_normalizer,
+                neighbours=int(getattr(config, "preference_energy_neighbours", 64)),
+                min_shared_condition_features=int(
+                    getattr(config, "preference_energy_min_shared_features", 3)
+                ),
+                cdf_temperature=float(
+                    getattr(config, "preference_energy_cdf_temperature", 0.04)
+                ),
+                preference_weight=float(
+                    getattr(config, "preference_energy_preference_weight", 1.0)
+                ),
+                safety_weight=float(
+                    getattr(config, "preference_energy_safety_weight", 4.0)
+                ),
+                free_drive_accel_support_mode=str(
+                    getattr(
+                        config,
+                        "free_drive_accel_support_mode",
+                        "self_generated",
+                    )
+                ),
+                dt=float(getattr(config, "preference_loss_dt", 0.1)),
+            )
+        else:
+            self.preference_energy = None
         
         self._guidance_fn = config.guidance_fn
         
@@ -132,7 +317,7 @@ class Decoder(nn.Module):
                     "neighbor_agent_past": past and current neighbor states,  
 
                     [training-only] "sampled_trajectories": sampled current-future ego & neighbor states,        [B, P, 1 + V_future, 4]
-                    [training-only] "diffusion_time": timestep of diffusion process $t \in [0, 1]$,              [B]
+                    [training-only] "diffusion_time": timestep of diffusion process t in [0, 1],                 [B]
                     ...
                 }
 
@@ -165,17 +350,19 @@ class Decoder(nn.Module):
         if is_diffusion_loss_pass:
             sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
             diffusion_time = inputs['diffusion_time']
+            style_condition = self._resolve_style_condition(inputs, B)
 
             denoised = self.dit(
                 sampled_trajectories,
                 diffusion_time,
-                style_condition=self._resolve_style_condition(inputs, B),
+                style_condition=style_condition,
                 cross_c=ego_neighbor_encoding,
                 route_lanes=route_lanes,
                 neighbor_current_mask=neighbor_current_mask,
                 phase_time_mask=self._resolve_phase_time_mask(inputs, B),
             ).reshape(B, P, -1, 4)
             temporal_debug = self.dit.pop_last_temporal_gate_outputs()
+            router_debug = self.dit.pop_last_axis_router_outputs()
             if self.dit.model_type == "x_start":
                 outputs = {
                     "x_start": denoised,
@@ -183,16 +370,50 @@ class Decoder(nn.Module):
                 }
                 if temporal_debug is not None:
                     outputs.update(temporal_debug)
+                if router_debug is not None:
+                    outputs.update(router_debug)
+                if (
+                    self.preference_energy is not None
+                    and style_condition is not None
+                    and not bool(inputs.get("disable_preference_energy", False))
+                ):
+                    prepared_energy = self.preference_energy.prepare(
+                        inputs,
+                        style_condition,
+                    )
+                    outputs.update(
+                        self.preference_energy.energy_terms(
+                            denoised,
+                            inputs,
+                            prepared_energy,
+                        )
+                    )
                 return outputs
             outputs = {
                 "score": denoised
             }
             if temporal_debug is not None:
                 outputs.update(temporal_debug)
+            if router_debug is not None:
+                outputs.update(router_debug)
             return outputs
         else:
-            # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
-            xT = torch.cat([current_states[:, :, None], torch.randn(B, P, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, P, -1)
+            warm_start_enabled = bool(inputs.get("warm_start_enabled", False))
+            if warm_start_enabled:
+                xT, sampling_t_start = self._build_warm_start_state(
+                    inputs,
+                    current_states,
+                    neighbor_current_mask,
+                )
+                diffusion_steps = self._warm_start_diffusion_steps
+            else:
+                # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
+                xT = torch.cat([
+                    current_states[:, :, None],
+                    torch.randn(B, P, self._future_len, 4, device=current_states.device) * 0.5,
+                ], dim=2).reshape(B, P, -1)
+                sampling_t_start = None
+                diffusion_steps = self._diffusion_steps
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, P, -1, 4)
@@ -200,18 +421,33 @@ class Decoder(nn.Module):
                 return xt.reshape(B, P, -1)
             
             style_condition = self._resolve_style_condition(inputs, B)
+            style_active = bool(
+                style_condition is not None
+                and torch.any(style_condition.abs() > 1e-6)
+            )
             temporal_debug = None
-            if style_condition is not None:
+            if style_active:
                 temporal_debug = self.dit.inspect_temporal_style_condition(
                     style_condition,
                     B,
                     device=current_states.device,
                     dtype=current_states.dtype,
                 )
-            if style_condition is not None:
+            normal_anchor_condition = self._resolve_normal_anchor_condition(inputs, B)
+            normal_anchor_active = bool(
+                self._normal_anchor_cfg_enabled
+                and normal_anchor_condition is not None
+                and torch.any(normal_anchor_condition.abs() > 1e-6)
+            )
+            if style_active:
+                cfg_reference = (
+                    normal_anchor_condition
+                    if normal_anchor_active
+                    else torch.zeros_like(style_condition)
+                )
                 model_wrapper_params = {
                     "condition": style_condition,
-                    "unconditional_condition": torch.zeros_like(style_condition),
+                    "unconditional_condition": cfg_reference,
                     "guidance_scale": float(inputs.get("cfg_guidance_scale", self._cfg_guidance_scale)),
                     "guidance_type": "classifier-free",
                 }
@@ -234,6 +470,45 @@ class Decoder(nn.Module):
                     "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"
                 }
 
+            prepared_energy = None
+            energy_guidance_applied = False
+            command_strength = 0.0
+            if style_active and style_condition is not None:
+                axis_mask = style_condition[:, 3:6].clamp(0.0, 1.0)
+                target_delta = (style_condition[:, 0:3] - 0.5).abs()
+                command_strength = float(
+                    ((target_delta * axis_mask).sum() / axis_mask.sum().clamp_min(1.0))
+                    .detach()
+                    .cpu()
+                )
+            if (
+                self.preference_energy is not None
+                and style_active
+            ):
+                prepared_energy = self.preference_energy.prepare(
+                    inputs,
+                    style_condition,
+                )
+                if (
+                    bool(prepared_energy["enabled"].any())
+                    and command_strength > 1e-5
+                    and self._preference_energy_guidance_scale > 0.0
+                ):
+                    model_wrapper_params.update(
+                        {
+                            "energy_fn": self.preference_energy.energy_from_model_output,
+                            "energy_scale": self._preference_energy_guidance_scale,
+                            "energy_kwargs": {
+                                "inputs": inputs,
+                                "prepared": prepared_energy,
+                            },
+                            "energy_grad_clip": self._preference_energy_grad_clip,
+                            "energy_t_min": self._preference_energy_t_min,
+                            "energy_t_max": self._preference_energy_t_max,
+                        }
+                    )
+                    energy_guidance_applied = True
+
             x0 = dpm_sampler(
                         self.dit,
                         xT,
@@ -247,17 +522,149 @@ class Decoder(nn.Module):
                             "correcting_xt_fn":initial_state_constraint,
                         },
                         model_wrapper_params=model_wrapper_params,
+                        diffusion_steps=diffusion_steps,
+                        sample_params=(
+                            {"t_start": sampling_t_start}
+                            if sampling_t_start is not None
+                            else {}
+                        ),
+                )
+            if (
+                self.preference_energy is not None
+                and prepared_energy is not None
+                and bool(prepared_energy["enabled"].any())
+            ):
+                # Always audit the final generated conditional percentiles,
+                # including rho=0 where the energy gradient is intentionally
+                # disabled. This gives the rho-sweep evaluator a common output
+                # contract without changing the trajectory.
+                self.preference_energy.energy_terms(
+                    x0.reshape(B, P, -1, 4),
+                    inputs,
+                    prepared_energy,
                 )
             if temporal_debug is None:
                 temporal_debug = self.dit.pop_last_temporal_gate_outputs()
+            router_debug = self.dit.pop_last_axis_router_outputs()
+            energy_debug = (
+                self.preference_energy.pop_last_diagnostics()
+                if self.preference_energy is not None
+                else None
+            )
             x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
 
             outputs = {
-                    "prediction": x0
-                }
+                "prediction": x0,
+                "normal_anchor_cfg_used": torch.full(
+                    (B,),
+                    normal_anchor_active and style_active,
+                    dtype=torch.bool,
+                    device=x0.device,
+                ),
+                "empty_cfg_reference_used": torch.full(
+                    (B,),
+                    style_active and not normal_anchor_active,
+                    dtype=torch.bool,
+                    device=x0.device,
+                ),
+                "preference_energy_guidance_used": torch.full(
+                    (B,),
+                    energy_guidance_applied,
+                    dtype=torch.bool,
+                    device=x0.device,
+                ),
+            }
             if temporal_debug is not None:
                 outputs.update(temporal_debug)
+            if router_debug is not None:
+                outputs.update(router_debug)
+            if energy_debug is not None:
+                outputs.update(energy_debug)
             return outputs
+
+    def _build_warm_start_state(self, inputs, current_states, neighbor_current_mask):
+        """Build a training-consistent joint state at a shared intermediate time.
+
+        Ego future comes from the map maneuver anchor.  Neighbor futures use a
+        constant-velocity anchor so every jointly denoised token starts at the
+        same VP-SDE time without changing the trained DiT architecture.
+        """
+
+        ego_anchor = inputs.get("warm_start_ego_anchor")
+        if ego_anchor is None:
+            raise KeyError("warm_start_enabled requires `warm_start_ego_anchor`")
+        if ego_anchor.dim() == 2:
+            ego_anchor = ego_anchor.unsqueeze(0)
+        B, P, _ = current_states.shape
+        expected_shape = (B, self._future_len, 4)
+        if tuple(ego_anchor.shape) != expected_shape:
+            raise ValueError(
+                "warm_start_ego_anchor must have shape "
+                f"{expected_shape}, got {tuple(ego_anchor.shape)}"
+            )
+        ego_anchor = ego_anchor.to(device=current_states.device, dtype=current_states.dtype)
+
+        t_start_value = inputs.get("warm_start_t", 0.30)
+        if torch.is_tensor(t_start_value):
+            values = t_start_value.detach().reshape(-1)
+            if values.numel() == 0:
+                raise ValueError("warm_start_t tensor cannot be empty")
+            if not torch.allclose(values, values[:1].expand_as(values), atol=1e-7, rtol=0.0):
+                raise ValueError("All candidates in one DPM-Solver batch must share warm_start_t")
+            t_start = float(values[0].cpu())
+        else:
+            t_start = float(t_start_value)
+        if not 1e-3 < t_start <= 1.0:
+            raise ValueError(f"warm_start_t must be in (1e-3, 1], got {t_start}")
+
+        # ``neighbor_agents_past`` is observation-normalized before reaching
+        # the model.  Constant-velocity extrapolation must use physical metres
+        # and m/s, therefore the warm-start planner supplies a raw copy solely
+        # for anchor construction.  It is not consumed by the encoder/DiT.
+        neighbor_past = inputs.get("warm_start_neighbor_past_raw")
+        if neighbor_past is None:
+            raise KeyError(
+                "warm_start_enabled requires `warm_start_neighbor_past_raw` in physical units"
+            )
+        neighbor_past = neighbor_past[:, : self._predicted_neighbor_num]
+        if neighbor_past.shape[0] != B or neighbor_past.shape[-1] < 6:
+            raise ValueError(
+                "warm_start_neighbor_past_raw must have shape [B, N, history, >=6]; "
+                f"got {tuple(neighbor_past.shape)}"
+            )
+        neighbor_past = neighbor_past.to(
+            device=current_states.device,
+            dtype=current_states.dtype,
+        )
+        neighbor_current = neighbor_past[:, :, -1, :]
+        time = (
+            torch.arange(1, self._future_len + 1, device=current_states.device, dtype=current_states.dtype)
+            * float(inputs.get("warm_start_dt", 0.1))
+        )
+        neighbor_xy = neighbor_current[..., :2, None] + neighbor_current[..., 4:6, None] * time
+        neighbor_xy = neighbor_xy.permute(0, 1, 3, 2)
+        neighbor_heading = neighbor_current[..., 2:4, None].permute(0, 1, 3, 2)
+        neighbor_heading = neighbor_heading.expand(-1, -1, self._future_len, -1)
+        neighbor_anchor = torch.cat([neighbor_xy, neighbor_heading], dim=-1)
+
+        joint_anchor = torch.cat([ego_anchor[:, None], neighbor_anchor], dim=1)
+        joint_anchor = self._state_normalizer(joint_anchor)
+        joint_anchor[:, 1:] = joint_anchor[:, 1:].masked_fill(
+            neighbor_current_mask[:, :, None, None], 0.0
+        )
+
+        diffusion_time = torch.full(
+            (B,), t_start, device=current_states.device, dtype=current_states.dtype
+        )
+        mean, std = self._sde.marginal_prob(joint_anchor, diffusion_time)
+        noise = torch.randn_like(mean)
+        if bool(inputs.get("warm_start_shared_noise", True)) and B > 1:
+            # Common random numbers make keep/left/right comparable: candidate
+            # differences are driven by their anchors, not unrelated noise.
+            noise = noise[:1].expand_as(mean)
+        x_t_future = mean + std * noise
+        x_t = torch.cat([current_states[:, :, None], x_t_future], dim=2).reshape(B, P, -1)
+        return x_t, t_start
 
     def _resolve_style_condition(self, inputs, batch_size: int):
         if (not self._use_style_condition) or self._style_value_dim <= 0:
@@ -270,6 +677,23 @@ class Decoder(nn.Module):
         if style_condition.shape[0] == 1 and batch_size > 1:
             style_condition = style_condition.expand(batch_size, -1)
         return style_condition
+
+    def _resolve_normal_anchor_condition(self, inputs, batch_size: int):
+        if (not self._use_style_condition) or self._style_value_dim <= 0:
+            return None
+        condition = inputs.get("normal_anchor_style_value_condition")
+        if condition is None:
+            return None
+        if condition.dim() == 1:
+            condition = condition.unsqueeze(0)
+        if condition.shape[0] == 1 and batch_size > 1:
+            condition = condition.expand(batch_size, -1)
+        if condition.shape[-1] != self._style_value_dim:
+            raise ValueError(
+                "normal_anchor_style_value_condition dimension mismatch: "
+                f"expected {self._style_value_dim}, got {condition.shape[-1]}"
+            )
+        return condition
 
     def _resolve_phase_time_mask(self, inputs, batch_size: int):
         if (not self._use_phase_style_condition) or self._phase_style_num_phases <= 0:
@@ -441,6 +865,12 @@ class DiT(nn.Module):
         use_phase_style_condition: bool = False,
         use_temporal_style_gate: bool = False,
         temporal_gate_hidden_dim: int = 0,
+        style_condition_encoder: str = "mlp",
+        axis_router_token_dim: int = 64,
+        signed_router_injection_mode: str = "global_adaln",
+        signed_router_diffusion_gate_mode: str = "all_steps",
+        signed_router_terminal_t_max: float = 0.0011,
+        kinematic_ego_basis_count: int = 6,
     ):
         """
         初始化 DiT
@@ -470,6 +900,75 @@ class DiT(nn.Module):
         self._phase_style_condition_dim = int(phase_style_condition_dim)
         self._phase_style_num_phases = int(phase_style_num_phases)
         self._phase_style_flat_dim = int(phase_style_flat_dim)
+        self.style_condition_encoder = str(style_condition_encoder)
+        self.signed_router_injection_mode = str(signed_router_injection_mode)
+        self.signed_router_diffusion_gate_mode = str(
+            signed_router_diffusion_gate_mode
+        )
+        self.signed_router_terminal_t_max = float(signed_router_terminal_t_max)
+        if (
+            self.signed_router_diffusion_gate_mode
+            not in SIGNED_ROUTER_DIFFUSION_GATE_MODES
+        ):
+            raise ValueError(
+                "signed_router_diffusion_gate_mode must be 'all_steps' or "
+                "'free_drive_terminal_only', got "
+                f"{self.signed_router_diffusion_gate_mode!r}"
+            )
+        if (
+            self.signed_router_diffusion_gate_mode
+            == "free_drive_terminal_only"
+            and self.signed_router_injection_mode
+            != "ego_axis_temporal_residual"
+        ):
+            raise ValueError(
+                "free-drive terminal-only execution requires "
+                "signed_router_injection_mode='ego_axis_temporal_residual'"
+            )
+        if (
+            self.signed_router_diffusion_gate_mode
+            == "free_drive_terminal_only"
+            and not 0.001 <= self.signed_router_terminal_t_max <= 0.0011
+        ):
+            raise ValueError(
+                "free-drive terminal-only execution requires "
+                "signed_router_terminal_t_max in [0.001, 0.0011]"
+            )
+        if self.signed_router_injection_mode not in {
+            "global_adaln",
+            "ego_output_residual",
+            "ego_kinematic_residual",
+            "ego_axis_temporal_residual",
+        }:
+            raise ValueError(
+                "signed_router_injection_mode must be 'global_adaln', "
+                "'ego_output_residual', 'ego_kinematic_residual', or "
+                "'ego_axis_temporal_residual', got "
+                f"{self.signed_router_injection_mode!r}"
+            )
+        if (
+            self.signed_router_injection_mode
+            in {
+                "ego_output_residual",
+                "ego_kinematic_residual",
+                "ego_axis_temporal_residual",
+            }
+            and self.style_condition_encoder != "axis_router_v2_signed"
+        ):
+            raise ValueError(
+                "ego output residual injection requires style_condition_encoder="
+                "'axis_router_v2_signed'"
+            )
+        if self.style_condition_encoder not in {
+            "mlp",
+            "axis_router_v1",
+            "axis_router_v2_signed",
+        }:
+            raise ValueError(
+                "style_condition_encoder must be 'mlp', 'axis_router_v1', "
+                "or 'axis_router_v2_signed', "
+                f"got {self.style_condition_encoder!r}"
+            )
 
         # 智能体类型嵌入：区分自车（index=0）和邻居（index=1）
         self.agent_embedding = nn.Embedding(2, hidden_dim)
@@ -498,16 +997,72 @@ class DiT(nn.Module):
             and self._phase_style_num_phases == 2
         )
         self._last_temporal_gate_outputs = None
+        self._last_axis_router_outputs = None
         if self.use_style_condition:
-            self.style_condition_proj = nn.Sequential(
-                nn.LayerNorm(self._global_style_condition_dim),
-                nn.Linear(self._global_style_condition_dim, hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
+            if self.style_condition_encoder in {
+                "axis_router_v1",
+                "axis_router_v2_signed",
+            }:
+                if self._global_style_condition_dim != 12:
+                    raise ValueError(
+                        f"{self.style_condition_encoder} requires "
+                        "global_style_condition_dim=12, "
+                        f"got {self._global_style_condition_dim}"
+                    )
+                if self.style_condition_encoder == "axis_router_v2_signed":
+                    self.style_condition_proj = SignedPreferenceAxisRouter(
+                        hidden_dim=hidden_dim,
+                        token_dim=int(axis_router_token_dim),
+                    )
+                else:
+                    self.style_condition_proj = PreferenceAxisRouter(
+                        hidden_dim=hidden_dim,
+                        token_dim=int(axis_router_token_dim),
+                        dropout=float(dropout),
+                    )
+            else:
+                self.style_condition_proj = nn.Sequential(
+                    nn.LayerNorm(self._global_style_condition_dim),
+                    nn.Linear(self._global_style_condition_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.LayerNorm(hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
         else:
             self.style_condition_proj = None
+        if (
+            self.use_style_condition
+            and self.style_condition_encoder == "axis_router_v2_signed"
+            and self.signed_router_injection_mode == "ego_output_residual"
+        ):
+            self.ego_style_output_proj = EgoSignedOutputAdapter(
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+            )
+        elif (
+            self.use_style_condition
+            and self.style_condition_encoder == "axis_router_v2_signed"
+            and self.signed_router_injection_mode == "ego_kinematic_residual"
+        ):
+            self.ego_style_output_proj = KinematicEgoSignedOutputAdapter(
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                basis_count=int(kinematic_ego_basis_count),
+            )
+        elif (
+            self.use_style_condition
+            and self.style_condition_encoder == "axis_router_v2_signed"
+            and self.signed_router_injection_mode == "ego_axis_temporal_residual"
+        ):
+            self.ego_style_output_proj = (
+                AxisTemporalKinematicEgoSignedOutputAdapter(
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    basis_count=int(kinematic_ego_basis_count),
+                )
+            )
+        else:
+            self.ego_style_output_proj = None
         if self.use_phase_style_condition:
             self.phase_style_step_proj = nn.Sequential(
                 nn.LayerNorm(self._phase_style_condition_dim),
@@ -589,6 +1144,7 @@ class DiT(nn.Module):
         """
         B, P, _ = x.shape
         self._last_temporal_gate_outputs = None
+        self._last_axis_router_outputs = None
         style_global_condition, phase_style_condition = self._split_style_condition(style_condition, B)
         phase_style_condition = self._apply_temporal_style_gate(
             style_global_condition,
@@ -629,8 +1185,34 @@ class DiT(nn.Module):
         y = route_encoding
         # 添加时间嵌入：[B, D]
         y = y + self.t_embedder(t)
+        style_residual = None
+        axis_style_residual = None
+        router_outputs = None
         if self.style_condition_proj is not None and style_global_condition is not None:
-            y = y + self.style_condition_proj(style_global_condition.to(device=y.device, dtype=y.dtype))
+            style_global_condition = style_global_condition.to(
+                device=y.device,
+                dtype=y.dtype,
+            )
+            if self.style_condition_encoder in {
+                "axis_router_v1",
+                "axis_router_v2_signed",
+            }:
+                scene_context = route_encoding
+                if cross_c is not None:
+                    scene_context = scene_context + cross_c.mean(dim=1)
+                style_residual, router_outputs = self.style_condition_proj(
+                    style_global_condition,
+                    scene_context,
+                )
+                axis_style_residual = router_outputs.pop(
+                    "_axis_router_axis_residual",
+                    None,
+                )
+                self._last_axis_router_outputs = router_outputs
+                if self.signed_router_injection_mode == "global_adaln":
+                    y = y + style_residual
+            else:
+                y = y + self.style_condition_proj(style_global_condition)
 
         # ========== 构建注意力掩码 ==========
         # attn_mask: [B, P] - True 表示需要 mask 的位置
@@ -646,6 +1228,61 @@ class DiT(nn.Module):
         # ========== 输出层 ==========
         # 预测去噪结果
         x = self.final_layer(x, y)
+        if self.ego_style_output_proj is not None and style_residual is not None:
+            if self.signed_router_injection_mode == "ego_kinematic_residual":
+                ego_residual = self.ego_style_output_proj(
+                    style_residual,
+                    x[:, 0, :],
+                ).to(dtype=x.dtype)
+            elif self.signed_router_injection_mode == "ego_axis_temporal_residual":
+                if axis_style_residual is None:
+                    raise RuntimeError(
+                        "A3.7 axis-temporal adapter requires per-axis signed "
+                        "Router residuals"
+                    )
+                free_drive_mask = style_global_condition[:, 6] > 0.5
+                ego_residual, axis_temporal_debug = self.ego_style_output_proj(
+                    style_residual,
+                    axis_style_residual,
+                    x[:, 0, :],
+                    free_drive_mask,
+                )
+                ego_residual = ego_residual.to(dtype=x.dtype)
+                diffusion_gate, terminal_active = _signed_router_diffusion_gate(
+                    t,
+                    free_drive_mask,
+                    mode=self.signed_router_diffusion_gate_mode,
+                    terminal_t_max=self.signed_router_terminal_t_max,
+                    dtype=x.dtype,
+                )
+                ego_residual = ego_residual * diffusion_gate[:, None]
+                axis_temporal_debug.update(
+                    {
+                        "axis_temporal_diffusion_gate": diffusion_gate,
+                        "axis_temporal_terminal_only_used": (
+                            free_drive_mask
+                            if self.signed_router_diffusion_gate_mode
+                            == "free_drive_terminal_only"
+                            else torch.zeros_like(free_drive_mask)
+                        ),
+                        "axis_temporal_terminal_active": (
+                            free_drive_mask & terminal_active
+                        ),
+                        "axis_temporal_diffusion_time": t.reshape(-1),
+                    }
+                )
+                if router_outputs is not None:
+                    router_outputs.update(axis_temporal_debug)
+            else:
+                ego_residual = self.ego_style_output_proj(style_residual).to(
+                    dtype=x.dtype
+                )
+            x = x.clone()
+            x[:, 0, :] = x[:, 0, :] + ego_residual
+            if router_outputs is not None:
+                router_outputs["axis_router_ego_output_residual_l2"] = (
+                    torch.linalg.norm(ego_residual, dim=-1)
+                )
 
         # ========== 模型类型处理 ==========
         if self._model_type == "score":
@@ -723,6 +1360,11 @@ class DiT(nn.Module):
     def pop_last_temporal_gate_outputs(self):
         payload = self._last_temporal_gate_outputs
         self._last_temporal_gate_outputs = None
+        return payload
+
+    def pop_last_axis_router_outputs(self):
+        payload = self._last_axis_router_outputs
+        self._last_axis_router_outputs = None
         return payload
 
     def inspect_temporal_style_condition(self, style_condition, batch_size: int, *, device, dtype):

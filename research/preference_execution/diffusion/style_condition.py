@@ -45,6 +45,12 @@ def resolve_style_condition_feature_set(config: Any) -> str:
 
 
 def validate_style_condition_args(condition_field: str, feature_set: str) -> None:
+    if condition_field == "style_value_condition" and feature_set != STYLE_CONDITION_FEATURE_SET_GLOBAL_ONLY:
+        raise ValueError(
+            "V6 direct-axis style_value_condition currently uses the explicit global-only layout. "
+            "The Preference Axis Router consumes that 12D layout internally; it does not reuse "
+            "the old expanded effective-preference feature sets."
+        )
     if feature_set in (
         STYLE_CONDITION_FEATURE_SET_EXEC_V2,
         STYLE_CONDITION_FEATURE_SET_PHASEWISE_EXEC_V1,

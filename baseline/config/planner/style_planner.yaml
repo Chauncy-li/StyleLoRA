@@ -14,9 +14,30 @@ style_planner:
     args_file: ???
     render_save_dir: ???
     raw_data_save_dir: ""
+    # Empty keeps the legacy behavior (trace beside raw step bundles). Set an
+    # explicit path to export lightweight runtime traces without step NPZ data.
+    runtime_trace_save_dir: ""
 
     guidance_fn: null
     runtime_preference_enabled: true
+    # Keep existing experiments on the legacy interface.  A V6 checkpoint
+    # switches this to continuous_v6 and must have style_value_dim=12 in its
+    # training args/checkpoint configuration.
+    runtime_style_mode: "legacy_preference_execution"
+    runtime_rho: 0.0
+    # Stage-B inference controls.  Training args keep CFG disabled; closed-loop
+    # launchers may explicitly enable the rho=0 semantic anchor at inference.
+    # Router-only rollback is exactly: enabled=false, scale=1.0.
+    normal_anchor_cfg_enabled: false
+    cfg_guidance_scale: 1.0
+    # Energy is intentionally kept outside the selected Stage-B experiment.
+    preference_energy_enabled: false
+    preference_energy_guidance_scale: 0.0
+    runtime_v6_min_router_confidence: 0.60
+    runtime_route_lane_change_intent: false
+    runtime_route_lane_change_intent_available: false
+    runtime_target_lane_available: false
+    runtime_target_lane_interaction_observable: false
     runtime_style_label: "normal"
     runtime_style_intensity: 0.0
     runtime_projection_stats_path: ""

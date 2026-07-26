@@ -21,6 +21,21 @@ from research.preference_execution.diffusion.style_condition import (
 from research.preference_execution.interaction_state.schema import SCENE_GATE_ORDER
 
 
+def _optional_condition_tensor(value: Any, device: torch.device) -> torch.Tensor | None:
+    """Move optional sidecar tensors while treating an empty export as absent.
+
+    V6 deliberately uses only the explicit global condition in its baseline.
+    Its legacy preference-execution auxiliary vectors are therefore empty.
+    Passing a `[B, 0]` tensor through to logging produced NaN reductions and
+    made an absent optional feature look present.
+    """
+
+    if value is None:
+        return None
+    tensor = value.to(device)
+    return None if tensor.numel() == 0 else tensor
+
+
 def apply_classifier_free_dropout(
     style_value_feature: torch.Tensor,
     style_feature_valid: torch.Tensor,
@@ -107,24 +122,15 @@ def prepare_preference_conditioned_batch(
     axis_gate_values = batch.get("axis_gate_values")
     scene_buckets = batch.get("scene_bucket")
 
-    if target_preference_scene_vec is not None:
-        target_preference_scene_vec = target_preference_scene_vec.to(device)
-    if safe_preference_scene_vec is not None:
-        safe_preference_scene_vec = safe_preference_scene_vec.to(device)
-    if effective_preference_scene_vec is not None:
-        effective_preference_scene_vec = effective_preference_scene_vec.to(device)
-    if target_preference_global_vec is not None:
-        target_preference_global_vec = target_preference_global_vec.to(device)
-    if safe_preference_global_vec is not None:
-        safe_preference_global_vec = safe_preference_global_vec.to(device)
-    if effective_preference_global_vec is not None:
-        effective_preference_global_vec = effective_preference_global_vec.to(device)
-    if local_axis_gate_values is not None:
-        local_axis_gate_values = local_axis_gate_values.to(device)
-    if scene_gate_values is not None:
-        scene_gate_values = scene_gate_values.to(device)
-    if axis_gate_values is not None:
-        axis_gate_values = axis_gate_values.to(device)
+    target_preference_scene_vec = _optional_condition_tensor(target_preference_scene_vec, device)
+    safe_preference_scene_vec = _optional_condition_tensor(safe_preference_scene_vec, device)
+    effective_preference_scene_vec = _optional_condition_tensor(effective_preference_scene_vec, device)
+    target_preference_global_vec = _optional_condition_tensor(target_preference_global_vec, device)
+    safe_preference_global_vec = _optional_condition_tensor(safe_preference_global_vec, device)
+    effective_preference_global_vec = _optional_condition_tensor(effective_preference_global_vec, device)
+    local_axis_gate_values = _optional_condition_tensor(local_axis_gate_values, device)
+    scene_gate_values = _optional_condition_tensor(scene_gate_values, device)
+    axis_gate_values = _optional_condition_tensor(axis_gate_values, device)
 
     feature_set = resolve_style_condition_feature_set(args)
     style_value_condition = build_style_condition_feature(
@@ -138,6 +144,25 @@ def prepare_preference_conditioned_batch(
         safe_global_vec=safe_preference_global_vec,
         scene_buckets=scene_buckets,
     )
+    normal_anchor_style_value_condition = batch.get(
+        "normal_anchor_style_value_condition"
+    )
+    if normal_anchor_style_value_condition is None:
+        normal_anchor_style_value_condition = torch.zeros_like(
+            style_value_condition
+        )
+    else:
+        normal_anchor_style_value_condition = (
+            normal_anchor_style_value_condition.to(device=device, dtype=torch.float32)
+        )
+        if tuple(normal_anchor_style_value_condition.shape) != tuple(
+            style_value_condition.shape
+        ):
+            # Legacy expanded feature sets do not define the V6 semantic
+            # normal anchor. They retain the old empty-condition behavior.
+            normal_anchor_style_value_condition = torch.zeros_like(
+                style_value_condition
+            )
     style_feature_valid = style_condition_valid_mask(style_value_condition).to(device)
     if train:
         style_value_condition, style_condition_used = apply_classifier_free_dropout(
@@ -149,6 +174,9 @@ def prepare_preference_conditioned_batch(
         style_condition_used = style_feature_valid.bool().view(-1)
 
     inputs["style_value_condition"] = style_value_condition
+    inputs[
+        "normal_anchor_style_value_condition"
+    ] = normal_anchor_style_value_condition
     inputs["style_feature_valid"] = style_feature_valid.float()
     inputs["style_condition_used"] = style_condition_used.float()
     inputs["cfg_guidance_scale"] = float(args.cfg_guidance_scale)
@@ -181,7 +209,17 @@ def prepare_preference_conditioned_batch(
         "safe_preference_global_vec": safe_preference_global_vec,
         "effective_preference_global_vec": effective_preference_global_vec,
         "preference_ego_current_xycs": batch["ego_current_state"][..., :4].to(device),
+        "preference_ego_current_state_raw": batch["ego_current_state"].to(device),
+        "preference_ego_agent_past_raw": batch["ego_agent_past"].to(device),
         "preference_neighbor_current_xycs": batch["neighbor_agents_past"][:, : args.predicted_neighbor_num, -1, :4].to(device),
+        "preference_neighbor_agents_past_raw": batch["neighbor_agents_past"][
+            :, : args.predicted_neighbor_num
+        ].to(device),
+        "preference_neighbor_agents_past_mask_raw": batch[
+            "neighbor_agents_past_mask"
+        ][:, : args.predicted_neighbor_num].to(device),
+        "preference_lanes_raw": batch["lanes"].to(device),
+        "preference_route_lanes_raw": batch["route_lanes"].to(device),
         "preference_route_lanes_speed_limit_raw": batch["route_lanes_speed_limit"].to(device),
         "preference_route_lanes_has_speed_limit_raw": batch["route_lanes_has_speed_limit"].to(device),
         "preference_route_lanes_mask_raw": batch["route_lanes_mask"].to(device),
@@ -198,6 +236,12 @@ def prepare_preference_conditioned_batch(
         "style_feature_valid_ratio": float(style_feature_valid.float().mean().item()),
         "style_condition_used_ratio": float(style_condition_used.float().mean().item()),
         "style_condition_l2": float(torch.linalg.norm(style_value_condition, dim=-1).mean().item()),
+        "normal_anchor_active_ratio": float(
+            style_condition_valid_mask(normal_anchor_style_value_condition)
+            .float()
+            .mean()
+            .item()
+        ),
     }
     if target_preference_scene_vec is not None:
         log_info["target_preference_l1"] = float(target_preference_scene_vec.abs().mean().item())

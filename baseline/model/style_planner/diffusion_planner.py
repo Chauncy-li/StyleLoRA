@@ -16,6 +16,10 @@ import torch.nn as nn
 # 导入底层的 Encoder 和 Decoder 实现
 from baseline.model.style_planner.layer.encoder import Encoder
 from baseline.model.style_planner.layer.decoder import Decoder
+from baseline.model.style_planner.layer.preference_axis_router import (
+    PreferenceAxisRouter,
+    SignedPreferenceAxisRouter,
+)
 
 
 class Diffusion_Planner(nn.Module):
@@ -185,6 +189,14 @@ class Diffusion_Planner_Decoder(nn.Module):
         nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.decoder.dit.final_layer.proj[-1].weight, 0)
         nn.init.constant_(self.decoder.dit.final_layer.proj[-1].bias, 0)
+        if isinstance(
+            self.decoder.dit.style_condition_proj,
+            (PreferenceAxisRouter, SignedPreferenceAxisRouter),
+        ):
+            # The generic Linear initialization above intentionally initializes
+            # the router internals, then this final projection is reset so a
+            # pretrained base planner starts with exactly zero style residual.
+            self.decoder.dit.style_condition_proj.reset_output_projection()
 
     def forward(self, encoder_outputs, inputs):
         """

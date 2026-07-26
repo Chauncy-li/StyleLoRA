@@ -10,6 +10,26 @@ from typing import Any, Dict, Mapping, Sequence
 from research.preference_execution.interaction_state.schema import AXIS_GATE_ORDER, SCENE_GATE_ORDER
 from research.style_scene_split.schema_v2 import style_axis_names_for_scene
 
+CONTROLLED_RUNTIME_SCENES: tuple[str, ...] = (
+    "straight_free_drive",
+    "straight_car_follow",
+)
+ENERGY_SUPPORT_REASON_NAMES = {
+    0: "enabled",
+    1: "scene_or_axis_inactive",
+    2: "missing_required_raw_input",
+    3: "insufficient_shared_condition_features",
+    4: "frozen_reference_unavailable",
+    5: "active_traffic_control",
+    6: "free_drive_not_clear",
+    7: "no_valid_reference_axis",
+}
+ENERGY_SPEED_LIMIT_SOURCE_NAMES = {
+    0: "none",
+    1: "route_lane",
+    2: "lane_fallback",
+}
+
 RUNTIME_CONTEXT_FIELD_ORDER: tuple[str, ...] = (
     "lead_vehicle_present",
     "following_min_gap",
@@ -54,6 +74,21 @@ def _global_from_local(axis_names: Sequence[str], local_values: Sequence[object]
 
 def _bool_or_zero(value: object) -> int:
     return int(bool(value))
+
+
+def _first_bool(value: object) -> bool:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return bool(value[0]) if len(value) > 0 else False
+    return bool(value)
+
+
+def _first_int(value: object, default: int = 0) -> int:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        value = value[0] if len(value) > 0 else default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _context_dict(debug: Mapping[str, object]) -> dict[str, object]:
@@ -134,6 +169,61 @@ def build_runtime_trace_row(
         for index, scene_name in enumerate(scene_gate_names)
     }
     context = _context_dict(debug)
+    generated_axis_percentile = _float_list(
+        debug.get("preference_generated_axis_percentile"),
+        len(scene_axis_names),
+    )
+    generated_raw_axis = _float_list(
+        debug.get("preference_generated_raw_axis"),
+        len(scene_axis_names),
+    )
+    generated_axis_valid = [
+        bool(value)
+        for value in list(
+            debug.get(
+                "preference_generated_axis_valid_mask",
+                [False] * len(scene_axis_names),
+            )
+        )[: len(scene_axis_names)]
+    ]
+    while len(generated_axis_valid) < len(scene_axis_names):
+        generated_axis_valid.append(False)
+    causal_axis_mask = [
+        bool(value)
+        for value in list(debug.get("causal_axis_mask", [False, False, False]))[
+            :3
+        ]
+    ]
+    while len(causal_axis_mask) < 3:
+        causal_axis_mask.append(False)
+    router_confident = bool(debug.get("router_confident", False))
+    style_condition_enabled = bool(
+        debug.get("style_condition_enabled", False)
+    )
+    controlled_router_active = bool(
+        scene_bucket in CONTROLLED_RUNTIME_SCENES
+        and router_confident
+        and style_condition_enabled
+        and any(causal_axis_mask)
+    )
+    energy_support_reason_code = _first_int(
+        debug.get("preference_energy_support_reason_code", 1),
+        default=1,
+    )
+    speed_limit_source_code = _first_int(
+        debug.get("preference_energy_speed_limit_source_code", 0),
+    )
+    energy_reference_valid = [
+        bool(value)
+        for value in list(
+            debug.get(
+                "preference_energy_reference_valid_axis_mask",
+                [False] * len(scene_axis_names),
+            )
+        )[: len(scene_axis_names)]
+    ]
+    while len(energy_reference_valid) < len(scene_axis_names):
+        energy_reference_valid.append(False)
 
     return {
         "step_index": int(step_index),
@@ -185,6 +275,96 @@ def build_runtime_trace_row(
                 axis_name: float(temporal_far_condition[index]) for index, axis_name in enumerate(axis_gate_names)
             },
         },
+        "v6_execution": {
+            "rho_requested": float(debug.get("rho_requested", 0.0)),
+            "router_confidence": float(debug.get("router_confidence", 0.0)),
+            "router_confident": router_confident,
+            "style_condition_enabled": style_condition_enabled,
+            "controlled_router_active": controlled_router_active,
+            "causal_axis_mask": causal_axis_mask,
+            "normal_anchor_cfg_requested": bool(
+                debug.get("normal_anchor_cfg_requested", False)
+            ),
+            "cfg_guidance_scale": float(
+                debug.get("cfg_guidance_scale", 1.0)
+            ),
+            "preference_energy_guidance_scale_requested": float(
+                debug.get("preference_energy_guidance_scale_requested", 0.0)
+            ),
+            "normal_anchor_cfg_used": _first_bool(
+                debug.get("normal_anchor_cfg_used", False)
+            ),
+            "empty_cfg_reference_used": _first_bool(
+                debug.get("empty_cfg_reference_used", False)
+            ),
+            "preference_energy_guidance_used": _first_bool(
+                debug.get("preference_energy_guidance_used", False)
+            ),
+            "preference_energy": float(debug.get("preference_energy", 0.0)),
+            "preference_axis_energy": float(
+                debug.get("preference_axis_energy", 0.0)
+            ),
+            "preference_safety_energy": float(
+                debug.get("preference_safety_energy", 0.0)
+            ),
+            "generated_axis_percentile_vec": generated_axis_percentile,
+            "generated_axis_valid_mask": generated_axis_valid,
+            "generated_axis_percentile": {
+                axis_name: float(generated_axis_percentile[index])
+                for index, axis_name in enumerate(scene_axis_names)
+            },
+            "generated_raw_axis": {
+                axis_name: float(generated_raw_axis[index])
+                for index, axis_name in enumerate(scene_axis_names)
+            },
+            "generated_axis_valid": {
+                axis_name: bool(generated_axis_valid[index])
+                for index, axis_name in enumerate(scene_axis_names)
+            },
+            "energy_support": {
+                "reason_code": energy_support_reason_code,
+                "reason": ENERGY_SUPPORT_REASON_NAMES.get(
+                    energy_support_reason_code,
+                    "unknown",
+                ),
+                "shared_condition_count": _first_int(
+                    debug.get(
+                        "preference_energy_shared_condition_count",
+                        0,
+                    )
+                ),
+                "speed_limit_source_code": speed_limit_source_code,
+                "speed_limit_source": ENERGY_SPEED_LIMIT_SOURCE_NAMES.get(
+                    speed_limit_source_code,
+                    "unknown",
+                ),
+                "speed_limit_valid": _first_bool(
+                    debug.get(
+                        "preference_energy_speed_limit_valid",
+                        False,
+                    )
+                ),
+                "route_curvature_valid": _first_bool(
+                    debug.get(
+                        "preference_energy_route_curvature_valid",
+                        False,
+                    )
+                ),
+                "free_drive_clear": _first_bool(
+                    debug.get(
+                        "preference_energy_free_drive_clear",
+                        False,
+                    )
+                ),
+                "active_traffic_control": _first_bool(
+                    debug.get(
+                        "preference_energy_active_traffic_control",
+                        False,
+                    )
+                ),
+                "reference_valid_axis_mask": energy_reference_valid,
+            },
+        },
     }
 
 
@@ -207,6 +387,10 @@ def runtime_trace_csv_fieldnames() -> list[str]:
         "selected_bucket_key",
         "selected_bucket_count",
         "dominant_scene_gate_score",
+        "router_confidence",
+        "router_confident",
+        "style_condition_enabled",
+        "controlled_router_active",
     ]
     fields.extend(RUNTIME_CONTEXT_FIELD_ORDER)
     fields.extend([f"scene_gate__{scene_name}" for scene_name in SCENE_GATE_ORDER])
@@ -233,6 +417,11 @@ def flatten_runtime_trace_row(row: Mapping[str, object]) -> Dict[str, object]:
     global_axes = dict(row.get("global_axes", {})) if isinstance(row.get("global_axes"), Mapping) else {}
     temporal_execution = (
         dict(row.get("temporal_execution", {})) if isinstance(row.get("temporal_execution"), Mapping) else {}
+    )
+    v6_execution = (
+        dict(row.get("v6_execution", {}))
+        if isinstance(row.get("v6_execution"), Mapping)
+        else {}
     )
     near_target = dict(temporal_execution.get("near_target", {})) if isinstance(temporal_execution.get("near_target"), Mapping) else {}
     far_target = dict(temporal_execution.get("far_target", {})) if isinstance(temporal_execution.get("far_target"), Mapping) else {}
@@ -264,6 +453,16 @@ def flatten_runtime_trace_row(row: Mapping[str, object]) -> Dict[str, object]:
         "selected_bucket_key": str(scene.get("selected_bucket_key", "")),
         "selected_bucket_count": int(scene.get("selected_bucket_count", 0)),
         "dominant_scene_gate_score": float(scene.get("dominant_scene_gate_score", 0.0)),
+        "router_confidence": float(v6_execution.get("router_confidence", 0.0)),
+        "router_confident": _bool_or_zero(
+            v6_execution.get("router_confident", False)
+        ),
+        "style_condition_enabled": _bool_or_zero(
+            v6_execution.get("style_condition_enabled", False)
+        ),
+        "controlled_router_active": _bool_or_zero(
+            v6_execution.get("controlled_router_active", False)
+        ),
     }
     for key in RUNTIME_CONTEXT_FIELD_ORDER:
         value = context.get(key, "")
