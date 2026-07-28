@@ -24,7 +24,7 @@ for _path in (REPO_ROOT, DEVKIT_ROOT):
     if _path.exists() and _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-from research._runtime import ensure_repo_on_path
+from research_v1.paths import ensure_repo_on_path
 
 ensure_repo_on_path()
 
@@ -39,10 +39,10 @@ from baseline.train.train_utils import resume_model, set_seed
 from baseline.utils.logger import WandbLogger as Logger
 from baseline.utils.lr_schedule import CosineAnnealingWarmUpRestarts
 from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
-from research._runtime import DEFAULT_CACHE_TRAIN_VAL_DIR, DEFAULT_NUM_WORKERS, DEFAULT_RECORD_ROOT
-from research.preference_execution.diffusion.dataset import PreferenceConditionedPlannerData
-from research.preference_execution.diffusion.preference_loss import compute_preference_aux_losses
-from research.preference_execution.diffusion.style_condition import (
+from research_v1.paths import DEFAULT_CACHE_TRAIN_VAL_DIR, DEFAULT_NUM_WORKERS, DEFAULT_RECORD_ROOT
+from research_v1.execution.diffusion.dataset import PreferenceConditionedPlannerData
+from research_v1.execution.diffusion.preference_loss import compute_preference_aux_losses
+from research_v1.execution.diffusion.style_condition import (
     STYLE_CONDITION_FEATURE_SET_CHOICES,
     global_style_condition_dim,
     phase_style_condition_dim,
@@ -52,13 +52,13 @@ from research.preference_execution.diffusion.style_condition import (
     use_temporal_style_gate,
     validate_style_condition_args,
 )
-from research.preference_execution.diffusion.training import (
+from research_v1.execution.diffusion.training import (
     build_experiment_dir,
     prepare_preference_conditioned_batch,
     serializable_args_dict,
     write_json,
 )
-from research.preference_execution.diffusion.v6_losses import (
+from research_v1.execution.diffusion.stylization_losses import (
     compute_exogenous_neighbor_invariance_loss,
     compute_normal_anchor_consistency_loss,
     compute_normal_reference_prediction,
@@ -67,7 +67,7 @@ from research.preference_execution.diffusion.v6_losses import (
     compute_signed_raw_axis_loss,
     decoder_reported_v6_losses,
 )
-from research.style_scene_split.defaults import (
+from research_v1.scene_data.paths import (
     DEFAULT_STYLE_SCENE_SPLIT_TRAIN_V2_DIR,
     DEFAULT_STYLE_SCENE_SPLIT_VAL_V2_DIR,
 )

@@ -41,13 +41,13 @@ from baseline.model.style_planner.diffusion_planner import Diffusion_Planner as 
 from baseline.model.wayformer.wayf_planner import WayFormer
 from baseline.simulation.anchor_generator import MapAnchorGenerator
 from baseline.simulation.candidate_selector import SafetyCandidateSelector
-from research.preference_execution.runtime import (
+from research_v1.execution.runtime import (
     OnlinePreferenceConditioner,
     append_runtime_trace_csv,
     append_runtime_trace_jsonl,
     build_runtime_trace_row,
 )
-from research.continuous_style.runtime import ContinuousStyleRuntimeConditioner
+from research_v1.stylization.runtime import ContinuousStyleRuntimeConditioner
 from baseline.simulation.render import NuplanScenarioRender
 from baseline.utils.config import Config
 

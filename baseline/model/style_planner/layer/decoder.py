@@ -22,6 +22,7 @@ from baseline.model.style_planner.layer.preference_axis_router import (
     EgoSignedOutputAdapter,
     KinematicEgoSignedOutputAdapter,
     PreferenceAxisRouter,
+    SceneAxisTemporalKinematicEgoSignedOutputAdapter,
     SignedPreferenceAxisRouter,
 )
 from baseline.model.style_planner.guidance.preference_energy import ConditionalPreferenceEnergy
@@ -81,6 +82,38 @@ def _signed_router_diffusion_gate(
     terminal_active = time <= threshold
     sample_active = (~free_drive) | terminal_active
     return sample_active.to(dtype=dtype), terminal_active
+
+
+def _diagnostic_style_residual_gate(
+    gate_value,
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """Normalize an optional Phase-0 residual gate to ``[B]``.
+
+    This is intentionally separate from the production A3.8 gate.  When the
+    diagnostic value is absent, the caller retains the historical inference
+    path bit-for-bit.  When present, it is a read-only experiment override
+    supplied by the sampler for one logical denoiser evaluation.
+    """
+
+    if gate_value is None:
+        return None
+    gate = torch.as_tensor(gate_value, device=device, dtype=dtype).reshape(-1)
+    if gate.numel() == 1:
+        gate = gate.expand(int(batch_size))
+    elif gate.numel() != int(batch_size):
+        raise ValueError(
+            "diagnostic_style_residual_gate must be scalar or have one value "
+            f"per sample ({batch_size}), got {tuple(gate.shape)}"
+        )
+    if not bool(torch.isfinite(gate).all()):
+        raise ValueError("diagnostic_style_residual_gate must be finite")
+    if bool(torch.any(gate < 0.0)) or bool(torch.any(gate > 1.0)):
+        raise ValueError("diagnostic_style_residual_gate must be in [0, 1]")
+    return gate
 
 
 def selftest_signed_router_diffusion_gate() -> dict[str, bool]:
@@ -444,25 +477,30 @@ class Decoder(nn.Module):
                     style_condition,
                 )
 
+            sampling_model_params = {
+                "cross_c": ego_neighbor_encoding,
+                "route_lanes": route_lanes,
+                "neighbor_current_mask": neighbor_current_mask,
+                "phase_time_mask": self._resolve_phase_time_mask(inputs, B),
+            }
+            transport_probe = inputs.get("transport_injection_probe")
+            if transport_probe is not None:
+                sampling_model_params["transport_injection_probe"] = transport_probe
+
             x0 = dpm_sampler(
-                        self.dit,
-                        xT,
-                        other_model_params={
-                            "cross_c": ego_neighbor_encoding, 
-                            "route_lanes": route_lanes,
-                            "neighbor_current_mask": neighbor_current_mask,
-                            "phase_time_mask": self._resolve_phase_time_mask(inputs, B),
-                        },
-                        dpm_solver_params={
-                            "correcting_xt_fn":initial_state_constraint,
-                        },
-                        model_wrapper_params=model_wrapper_params,
-                        diffusion_steps=diffusion_steps,
-                        sample_params=(
-                            {"t_start": sampling_t_start}
-                            if sampling_t_start is not None
-                            else {}
-                        ),
+                self.dit,
+                xT,
+                other_model_params=sampling_model_params,
+                dpm_solver_params={
+                    "correcting_xt_fn": initial_state_constraint,
+                },
+                model_wrapper_params=model_wrapper_params,
+                diffusion_steps=diffusion_steps,
+                sample_params=(
+                    {"t_start": sampling_t_start}
+                    if sampling_t_start is not None
+                    else {}
+                ),
             )
             if (
                 self.preference_axis_objective is not None
@@ -845,11 +883,14 @@ class DiT(nn.Module):
             self.signed_router_diffusion_gate_mode
             == "free_drive_terminal_only"
             and self.signed_router_injection_mode
-            != "ego_axis_temporal_residual"
+            not in {
+                "ego_axis_temporal_residual",
+                "ego_scene_axis_temporal_residual",
+            }
         ):
             raise ValueError(
                 "free-drive terminal-only execution requires "
-                "signed_router_injection_mode='ego_axis_temporal_residual'"
+                "an axis-temporal signed_router_injection_mode"
             )
         if (
             self.signed_router_diffusion_gate_mode
@@ -865,11 +906,12 @@ class DiT(nn.Module):
             "ego_output_residual",
             "ego_kinematic_residual",
             "ego_axis_temporal_residual",
+            "ego_scene_axis_temporal_residual",
         }:
             raise ValueError(
                 "signed_router_injection_mode must be 'global_adaln', "
                 "'ego_output_residual', 'ego_kinematic_residual', or "
-                "'ego_axis_temporal_residual', got "
+                "'ego_axis_temporal_residual'/'ego_scene_axis_temporal_residual', got "
                 f"{self.signed_router_injection_mode!r}"
             )
         if (
@@ -878,6 +920,7 @@ class DiT(nn.Module):
                 "ego_output_residual",
                 "ego_kinematic_residual",
                 "ego_axis_temporal_residual",
+                "ego_scene_axis_temporal_residual",
             }
             and self.style_condition_encoder != "axis_router_v2_signed"
         ):
@@ -987,6 +1030,18 @@ class DiT(nn.Module):
                     basis_count=int(kinematic_ego_basis_count),
                 )
             )
+        elif (
+            self.use_style_condition
+            and self.style_condition_encoder == "axis_router_v2_signed"
+            and self.signed_router_injection_mode == "ego_scene_axis_temporal_residual"
+        ):
+            self.ego_style_output_proj = (
+                SceneAxisTemporalKinematicEgoSignedOutputAdapter(
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    basis_count=int(kinematic_ego_basis_count),
+                )
+            )
         else:
             self.ego_style_output_proj = None
         if self.use_phase_style_condition:
@@ -1035,6 +1090,8 @@ class DiT(nn.Module):
         route_lanes=None,
         neighbor_current_mask=None,
         phase_time_mask=None,
+        diagnostic_style_residual_gate=None,
+        diagnostic_style_residual_eval_index=None,
     ):
         """
         DiT 前向传播
@@ -1071,6 +1128,12 @@ class DiT(nn.Module):
         B, P, _ = x.shape
         self._last_temporal_gate_outputs = None
         self._last_axis_router_outputs = None
+        diagnostic_residual_gate = _diagnostic_style_residual_gate(
+            diagnostic_style_residual_gate,
+            batch_size=B,
+            device=x.device,
+            dtype=x.dtype,
+        )
         style_global_condition, phase_style_condition = self._split_style_condition(style_condition, B)
         phase_style_condition = self._apply_temporal_style_gate(
             style_global_condition,
@@ -1136,7 +1199,10 @@ class DiT(nn.Module):
                 )
                 self._last_axis_router_outputs = router_outputs
                 if self.signed_router_injection_mode == "global_adaln":
-                    y = y + style_residual
+                    if diagnostic_residual_gate is None:
+                        y = y + style_residual
+                    else:
+                        y = y + style_residual * diagnostic_residual_gate[:, None]
             else:
                 y = y + self.style_condition_proj(style_global_condition)
 
@@ -1160,41 +1226,77 @@ class DiT(nn.Module):
                     style_residual,
                     x[:, 0, :],
                 ).to(dtype=x.dtype)
-            elif self.signed_router_injection_mode == "ego_axis_temporal_residual":
+            elif self.signed_router_injection_mode in {
+                "ego_axis_temporal_residual",
+                "ego_scene_axis_temporal_residual",
+            }:
                 if axis_style_residual is None:
                     raise RuntimeError(
                         "A3.7 axis-temporal adapter requires per-axis signed "
                         "Router residuals"
                     )
                 free_drive_mask = style_global_condition[:, 6] > 0.5
-                ego_residual, axis_temporal_debug = self.ego_style_output_proj(
-                    style_residual,
-                    axis_style_residual,
-                    x[:, 0, :],
-                    free_drive_mask,
-                )
+                if self.signed_router_injection_mode == "ego_axis_temporal_residual":
+                    ego_residual, axis_temporal_debug = self.ego_style_output_proj(
+                        style_residual,
+                        axis_style_residual,
+                        x[:, 0, :],
+                        free_drive_mask,
+                    )
+                else:
+                    car_follow_mask = style_global_condition[:, 7] > 0.5
+                    ego_residual, axis_temporal_debug = self.ego_style_output_proj(
+                        style_residual,
+                        axis_style_residual,
+                        x[:, 0, :],
+                        free_drive_mask,
+                        car_follow_mask,
+                    )
                 ego_residual = ego_residual.to(dtype=x.dtype)
-                diffusion_gate, terminal_active = _signed_router_diffusion_gate(
-                    t,
-                    free_drive_mask,
-                    mode=self.signed_router_diffusion_gate_mode,
-                    terminal_t_max=self.signed_router_terminal_t_max,
-                    dtype=x.dtype,
-                )
+                if diagnostic_residual_gate is None:
+                    diffusion_gate, terminal_active = _signed_router_diffusion_gate(
+                        t,
+                        free_drive_mask,
+                        mode=self.signed_router_diffusion_gate_mode,
+                        terminal_t_max=self.signed_router_terminal_t_max,
+                        dtype=x.dtype,
+                    )
+                else:
+                    # Phase-0 must be able to test early/middle/late calls even
+                    # for an A3.8 checkpoint whose production free-drive gate
+                    # is terminal-only.  This override never exists in normal
+                    # inference and does not alter a checkpoint parameter.
+                    diffusion_gate = diagnostic_residual_gate
+                    terminal_active = torch.zeros_like(free_drive_mask)
                 ego_residual = ego_residual * diffusion_gate[:, None]
                 axis_temporal_debug.update(
                     {
                         "axis_temporal_diffusion_gate": diffusion_gate,
                         "axis_temporal_terminal_only_used": (
                             free_drive_mask
-                            if self.signed_router_diffusion_gate_mode
-                            == "free_drive_terminal_only"
+                            if (
+                                diagnostic_residual_gate is None
+                                and self.signed_router_diffusion_gate_mode
+                                == "free_drive_terminal_only"
+                            )
                             else torch.zeros_like(free_drive_mask)
                         ),
                         "axis_temporal_terminal_active": (
                             free_drive_mask & terminal_active
                         ),
                         "axis_temporal_diffusion_time": t.reshape(-1),
+                        "axis_temporal_transport_probe_used": torch.full_like(
+                            free_drive_mask,
+                            diagnostic_residual_gate is not None,
+                        ),
+                        "axis_temporal_transport_probe_eval_index": torch.full(
+                            (B,),
+                            int(diagnostic_style_residual_eval_index)
+                            if diagnostic_style_residual_eval_index is not None
+                            else -1,
+                            device=x.device,
+                            dtype=torch.long,
+                        ),
                     }
                 )
                 if router_outputs is not None:
@@ -1203,6 +1305,15 @@ class DiT(nn.Module):
                 ego_residual = self.ego_style_output_proj(style_residual).to(
                     dtype=x.dtype
                 )
+            if (
+                diagnostic_residual_gate is not None
+                and self.signed_router_injection_mode
+                not in {
+                    "ego_axis_temporal_residual",
+                    "ego_scene_axis_temporal_residual",
+                }
+            ):
+                ego_residual = ego_residual * diagnostic_residual_gate[:, None]
             x = x.clone()
             x[:, 0, :] = x[:, 0, :] + ego_residual
             if router_outputs is not None:

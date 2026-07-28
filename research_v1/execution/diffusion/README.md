@@ -115,7 +115,7 @@ starting at scale 1.0 and then testing 1.1/1.2.
 
 Stage-B checkpoint evaluation reuses the frozen Stage-A checkpoint without
 training or changing its state dict. In
-`evaluate_styleplanner_v6_checkpoints.py`, the `router_only` variant explicitly
+`research_v1.execution.evaluation.evaluate_checkpoints`, the `router_only` variant explicitly
 disables Normal-Anchor CFG and the `anchor_cfg` variant explicitly enables it
 at runtime. This override is required because Stage-A `args.json` correctly
 saves `normal_anchor_cfg_enabled=false`; changing only
@@ -378,7 +378,7 @@ or loss-stage change.
 
 ### Multi-seed candidate audit and later scene scaling
 
-`evaluate_styleplanner_v6_checkpoints.py` accepts multiple checkpoint epochs in
+`research_v1.execution.evaluation.evaluate_checkpoints` accepts multiple checkpoint epochs in
 one invocation. `--num-seeds 3` repeats every fixed `(sample, rho)` command with
 three paired diffusion-noise replicas; it does not update model weights. The
 evaluator now writes both the historical aggregate report and:
@@ -406,7 +406,7 @@ generalization, so one must not be reported as a substitute for the other.
 An existing output can be re-summarized without loading a checkpoint:
 
 ```bash
-python -m research.preference_execution.eval.summarize_styleplanner_v6_multiseed \
+python -m research_v1.execution.evaluation.summarize_multiseed \
   --output-root /path/to/rho_sweep \
   --checkpoint-tags epoch_2,epoch_5 \
   --variants router_only
@@ -529,7 +529,7 @@ The train V5 normalization and conditional-rank model paths are supplied only
 as frozen raw-axis references and must be explicit:
 
 ```bash
-python -m research.preference_execution.diffusion.train_preference_conditioned_diffusion \
+python -m research_v1.execution.diffusion.train_stylized_diffusion \
   --experiment_preset v6_signed_router_ncqt_stage_a2 \
   --pretrained_model_path /path/to/verified_base_planner.pth \
   --train_conditioning_index_override /path/to/train/v6_direct_axis_conditions.jsonl \
@@ -541,7 +541,7 @@ python -m research.preference_execution.diffusion.train_preference_conditioned_d
 ## Structural self-test
 
 ```bash
-python -m research.preference_execution.diffusion.selftest_styleplanner_v6_modules \
+python -m research_v1.execution.diffusion.selftest_stylization \
   --normalization-path /path/to/train/v5_normalization.json \
   --conditional-rank-model-path /path/to/train/v5_conditional_rank_model.json
 ```

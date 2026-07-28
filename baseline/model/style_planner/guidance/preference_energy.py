@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from research.continuous_style.soft_metrics import (
+from research_v1.stylization.soft_metrics import (
     safe_headway_series,
     safe_ttc_series,
     soft_high_quantile,

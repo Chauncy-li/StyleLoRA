@@ -21,8 +21,8 @@ from baseline.model.style_planner.layer.preference_axis_router import (
     selftest_scene_axis_temporal_kinematic_ego_signed_output_adapter,
     selftest_signed_preference_axis_router,
 )
-from research.continuous_style.v6 import build_rho_style_command
-from research.preference_execution.diffusion.v6_losses import (
+from research_v1.stylization.commands import build_rho_style_command
+from research_v1.execution.diffusion.stylization_losses import (
     selftest_soft_worst_axis_aggregation,
     selftest_short_rollout_dpmpp,
 )

@@ -764,6 +764,236 @@ class AxisTemporalKinematicEgoSignedOutputAdapter(
         return output, debug
 
 
+class SceneAxisTemporalKinematicEgoSignedOutputAdapter(
+    AxisTemporalKinematicEgoSignedOutputAdapter
+):
+    """B3 scene-axis executor with independent free-drive and car-follow banks.
+
+    This is deliberately a subclass of the A3.7/A3.8 adapter.  It retains the
+    free-drive module names and fixed bases so an A3.8 checkpoint can initialize
+    that branch exactly.  B3 adds a separate three-axis car-follow bank and
+    never selects the inherited global ``control_projection`` at inference.
+    The 12-D V6 condition, its masks, and all data-side axis definitions are
+    unchanged; scene routing uses only the existing free-drive/car-follow gates.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        output_dim: int,
+        state_dim: int = 4,
+        basis_count: int = 6,
+    ) -> None:
+        super().__init__(
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            state_dim=state_dim,
+            basis_count=basis_count,
+        )
+        self.car_follow_axis_control_projections = nn.ModuleList(
+            [
+                nn.Linear(self.hidden_dim, self.basis_count, bias=False)
+                for _ in range(V6_AXIS_COUNT)
+            ]
+        )
+        for projection in self.car_follow_axis_control_projections:
+            nn.init.normal_(projection.weight, mean=0.0, std=0.02)
+        self.register_buffer(
+            "car_follow_axis_acceleration_basis",
+            self._build_car_follow_axis_acceleration_bases(
+                future_steps=self.future_steps,
+                basis_count=self.basis_count,
+            ),
+            persistent=False,
+        )
+
+    @classmethod
+    def _build_car_follow_axis_acceleration_bases(
+        cls,
+        *,
+        future_steps: int,
+        basis_count: int,
+    ) -> torch.Tensor:
+        """Build fixed headway/TTC/closing-tolerance time banks.
+
+        Headway is a long-horizon following-distance adjustment. TTC is more
+        local because it represents conflict urgency. Closing tolerance uses a
+        medium/late response bank.  As in A3.7, every column is energy-matched
+        to the historical Bernstein basis so B3 changes temporal support and
+        routing, never an implicit per-axis gain.
+        """
+
+        long_horizon = cls._build_acceleration_basis(
+            future_steps=future_steps,
+            basis_count=basis_count,
+        )
+        u = torch.arange(1, future_steps + 1, dtype=torch.float32) / float(
+            future_steps
+        )
+        target_column_l2 = torch.linalg.norm(
+            long_horizon,
+            dim=0,
+            keepdim=True,
+        )
+
+        def _gaussian_bank(*, start: float, end: float, width: float) -> torch.Tensor:
+            centers = torch.linspace(start, end, basis_count, dtype=torch.float32)
+            bank = u.unsqueeze(-1) * torch.exp(
+                -0.5 * ((u.unsqueeze(-1) - centers.unsqueeze(0)) / width).pow(2)
+            )
+            return (
+                bank
+                / torch.linalg.norm(bank, dim=0, keepdim=True).clamp_min(1e-6)
+                * target_column_l2
+            )
+
+        ttc_local = _gaussian_bank(start=0.04, end=0.62, width=0.13)
+        closing_medium_late = _gaussian_bank(start=0.20, end=0.92, width=0.18)
+        return torch.stack(
+            [long_horizon, ttc_local, closing_medium_late],
+            dim=0,
+        )
+
+    @staticmethod
+    def _axis_acceleration(
+        signed_axis_residual: torch.Tensor,
+        projections: nn.ModuleList,
+        basis: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        coefficients = torch.stack(
+            [
+                projection(signed_axis_residual[:, axis_index, :])
+                for axis_index, projection in enumerate(projections)
+            ],
+            dim=1,
+        )
+        basis = basis.to(device=coefficients.device, dtype=coefficients.dtype)
+        acceleration = torch.einsum("bjk,jtk->bjt", coefficients, basis)
+        return coefficients, acceleration
+
+    def forward(
+        self,
+        signed_residual: torch.Tensor,
+        signed_axis_residual: torch.Tensor,
+        base_ego_output: torch.Tensor,
+        free_drive_mask: torch.Tensor,
+        car_follow_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        # Keep the exact A3.7 input contract, then validate the second existing
+        # V6 scene gate. ``signed_residual`` is intentionally unused after the
+        # shape check: B3 must not retain a hidden global fallback.
+        if signed_residual.ndim != 2 or signed_residual.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "signed_residual must have shape "
+                f"[B, {self.hidden_dim}], got {tuple(signed_residual.shape)}"
+            )
+        expected_axis_shape = (
+            signed_residual.shape[0],
+            V6_AXIS_COUNT,
+            self.hidden_dim,
+        )
+        if tuple(signed_axis_residual.shape) != expected_axis_shape:
+            raise ValueError(
+                "signed_axis_residual must have shape "
+                f"{expected_axis_shape}, got {tuple(signed_axis_residual.shape)}"
+            )
+        for name, mask in (
+            ("free_drive_mask", free_drive_mask),
+            ("car_follow_mask", car_follow_mask),
+        ):
+            if mask.ndim != 1 or mask.shape[0] != signed_residual.shape[0]:
+                raise ValueError(
+                    f"{name} must have shape [{signed_residual.shape[0]}], "
+                    f"got {tuple(mask.shape)}"
+                )
+
+        free_coefficients, free_axis_acceleration = self._axis_acceleration(
+            signed_axis_residual,
+            self.axis_control_projections,
+            self.axis_acceleration_basis,
+        )
+        car_coefficients, car_axis_acceleration = self._axis_acceleration(
+            signed_axis_residual,
+            self.car_follow_axis_control_projections,
+            self.car_follow_axis_acceleration_basis,
+        )
+        free_drive_mask = free_drive_mask.to(
+            device=free_axis_acceleration.device,
+            dtype=torch.bool,
+        )
+        car_follow_mask = car_follow_mask.to(
+            device=free_axis_acceleration.device,
+            dtype=torch.bool,
+        )
+        if bool(torch.any(free_drive_mask & car_follow_mask)):
+            raise ValueError("free_drive_mask and car_follow_mask must be disjoint")
+
+        free_acceleration = free_axis_acceleration.sum(dim=1)
+        car_acceleration = car_axis_acceleration.sum(dim=1)
+        relative_acceleration = torch.where(
+            free_drive_mask.unsqueeze(-1),
+            free_acceleration,
+            torch.where(
+                car_follow_mask.unsqueeze(-1),
+                car_acceleration,
+                torch.zeros_like(free_acceleration),
+            ),
+        )
+        output = self._acceleration_to_output(relative_acceleration, base_ego_output)
+
+        scene_axis_acceleration = torch.where(
+            free_drive_mask[:, None, None],
+            free_axis_acceleration,
+            torch.where(
+                car_follow_mask[:, None, None],
+                car_axis_acceleration,
+                torch.zeros_like(free_axis_acceleration),
+            ),
+        )
+        scene_axis_coefficients = torch.where(
+            free_drive_mask[:, None, None],
+            free_coefficients,
+            torch.where(
+                car_follow_mask[:, None, None],
+                car_coefficients,
+                torch.zeros_like(free_coefficients),
+            ),
+        )
+        first_end = max(self.future_steps // 3, 1)
+        second_end = max(2 * self.future_steps // 3, first_end + 1)
+        scene_axis_used = free_drive_mask | car_follow_mask
+        debug = {
+            "axis_temporal_free_drive_used": free_drive_mask,
+            "axis_temporal_car_follow_used": car_follow_mask,
+            "axis_temporal_scene_axis_used": scene_axis_used,
+            "axis_temporal_legacy_fallback_used": torch.zeros_like(scene_axis_used),
+            "axis_temporal_coefficient_l2": torch.linalg.norm(
+                scene_axis_coefficients,
+                dim=-1,
+            ),
+            "axis_temporal_acceleration_rms": torch.sqrt(
+                scene_axis_acceleration.pow(2).mean(dim=-1)
+            ),
+            "axis_temporal_acceleration_early_mean": scene_axis_acceleration[
+                :, :, :first_end
+            ].mean(dim=-1),
+            "axis_temporal_acceleration_mid_mean": scene_axis_acceleration[
+                :, :, first_end:second_end
+            ].mean(dim=-1),
+            "axis_temporal_acceleration_late_mean": scene_axis_acceleration[
+                :, :, second_end:
+            ].mean(dim=-1),
+            "axis_temporal_profile_cosine": self._profile_cosines(
+                scene_axis_acceleration
+            ),
+            "axis_temporal_total_acceleration_rms": torch.sqrt(
+                relative_acceleration.pow(2).mean(dim=-1)
+            ),
+        }
+        return output, debug
+
+
 def selftest_preference_axis_router() -> Dict[str, object]:
     """Small deterministic structural self-test; no planner checkpoint needed."""
 
@@ -1037,6 +1267,122 @@ def selftest_axis_temporal_kinematic_ego_signed_output_adapter() -> Dict[str, ob
         ),
         "free_drive_selector_is_exact": bool(
             torch.equal(debug["axis_temporal_free_drive_used"], free_mask)
+        ),
+        "diagnostics_are_finite": bool(
+            all(
+                torch.isfinite(value.float()).all()
+                for value in debug.values()
+                if torch.is_tensor(value)
+            )
+        ),
+    }
+
+
+def selftest_scene_axis_temporal_kinematic_ego_signed_output_adapter() -> Dict[str, object]:
+    """Verify B3 has no car-follow global-acceleration fallback."""
+
+    torch.manual_seed(31)
+    adapter = SceneAxisTemporalKinematicEgoSignedOutputAdapter(
+        hidden_dim=16,
+        output_dim=36,
+        state_dim=4,
+        basis_count=4,
+    )
+    axis_residual = torch.randn(3, V6_AXIS_COUNT, 16)
+    global_residual = axis_residual.sum(dim=1)
+    base_states = torch.zeros(3, 9, 4)
+    base_states[:, :, 0] = torch.linspace(0.0, 1.0, 9)
+    base_states[:, :, 2] = 1.0
+    base_output = base_states.reshape(3, 36)
+    free_mask = torch.tensor([True, False, False])
+    car_mask = torch.tensor([False, True, False])
+
+    positive, debug = adapter(
+        global_residual,
+        axis_residual,
+        base_output,
+        free_mask,
+        car_mask,
+    )
+    negative, _ = adapter(
+        -global_residual,
+        -axis_residual,
+        base_output,
+        free_mask,
+        car_mask,
+    )
+    zero, _ = adapter(
+        torch.zeros_like(global_residual),
+        torch.zeros_like(axis_residual),
+        base_output,
+        free_mask,
+        car_mask,
+    )
+    changed_global = global_residual + torch.randn_like(global_residual)
+    global_same, _ = adapter(
+        changed_global,
+        axis_residual,
+        base_output,
+        free_mask,
+        car_mask,
+    )
+    changed_axes = axis_residual.clone()
+    changed_axes[1] = changed_axes[1] + torch.randn_like(changed_axes[1])
+    car_changed, _ = adapter(
+        global_residual,
+        changed_axes,
+        base_output,
+        free_mask,
+        car_mask,
+    )
+    positive_states = positive.reshape(3, 9, 4)
+    return {
+        "zero_input_exact_zero": bool(torch.equal(zero, torch.zeros_like(zero))),
+        "sign_flip_exact_odd": bool(
+            torch.allclose(positive, -negative, atol=1e-7, rtol=1e-6)
+        ),
+        "current_state_exact_zero": bool(
+            torch.equal(
+                positive_states[:, 0, :],
+                torch.zeros_like(positive_states[:, 0, :]),
+            )
+        ),
+        "future_heading_exact_zero": bool(
+            torch.equal(
+                positive_states[:, 1:, 2:4],
+                torch.zeros_like(positive_states[:, 1:, 2:4]),
+            )
+        ),
+        "free_drive_uses_axis_path_only": bool(
+            torch.allclose(positive[0], global_same[0], atol=1e-7, rtol=1e-6)
+        ),
+        "car_follow_uses_axis_path_only": bool(
+            torch.allclose(positive[1], global_same[1], atol=1e-7, rtol=1e-6)
+        ),
+        "car_follow_axis_change_changes_only_car_follow": bool(
+            torch.allclose(positive[0], car_changed[0], atol=1e-7, rtol=1e-6)
+            and not torch.allclose(positive[1], car_changed[1], atol=1e-7, rtol=1e-6)
+        ),
+        "uncontrolled_scene_exact_zero": bool(
+            torch.equal(positive[2], torch.zeros_like(positive[2]))
+        ),
+        "scene_selectors_are_exact": bool(
+            torch.equal(debug["axis_temporal_free_drive_used"], free_mask)
+            and torch.equal(debug["axis_temporal_car_follow_used"], car_mask)
+            and torch.equal(
+                debug["axis_temporal_legacy_fallback_used"],
+                torch.zeros_like(free_mask),
+            )
+        ),
+        "car_follow_time_banks_are_distinct": bool(
+            not torch.allclose(
+                adapter.car_follow_axis_acceleration_basis[0],
+                adapter.car_follow_axis_acceleration_basis[1],
+            )
+            and not torch.allclose(
+                adapter.car_follow_axis_acceleration_basis[0],
+                adapter.car_follow_axis_acceleration_basis[2],
+            )
         ),
         "diagnostics_are_finite": bool(
             all(
