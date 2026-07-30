@@ -12,7 +12,10 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 
-from baseline.model.style_planner.library.sampling import dpm_sampler
+from baseline.model.style_planner.library.sampling import (
+    dpm_sampler,
+    dual_stream_dpm_sampler,
+)
 from baseline.model.style_planner.library.sde import SDE, VPSDE_linear
 from baseline.utils.normalizer import ObservationNormalizer, StateNormalizer
 from baseline.model.style_planner.layer.mixer import MixerBlock
@@ -26,6 +29,12 @@ from baseline.model.style_planner.layer.preference_axis_router import (
     SignedPreferenceAxisRouter,
 )
 from baseline.model.style_planner.guidance.preference_energy import ConditionalPreferenceEnergy
+from baseline.model.style_planner.preference_flow import (
+    CLEAN_PREDICTION_EDITOR_DISABLED,
+    CLEAN_PREDICTION_EDITOR_IDENTITY,
+    resolve_clean_prediction_editor_mode,
+    IdentityCleanPredictionEditor,
+)
 
 
 SIGNED_ROUTER_DIFFUSION_GATE_MODES = (
@@ -204,6 +213,18 @@ class Decoder(nn.Module):
         self._future_len = config.future_len
         self._sde = VPSDE_linear()
         self._diffusion_steps = int(getattr(config, "diffusion_steps", 10))
+        self._clean_prediction_editor_mode = resolve_clean_prediction_editor_mode(config)
+        if self._clean_prediction_editor_mode == CLEAN_PREDICTION_EDITOR_DISABLED:
+            self._clean_prediction_editor = None
+        elif self._clean_prediction_editor_mode == CLEAN_PREDICTION_EDITOR_IDENTITY:
+            # This is a plain Python object, not an nn.Module: it has no model
+            # parameters or checkpoint state and returns the original x0 tensor.
+            self._clean_prediction_editor = IdentityCleanPredictionEditor()
+        else:
+            raise RuntimeError(
+                "clean_prediction_editor_mode passed configuration validation but "
+                f"is not constructible: {self._clean_prediction_editor_mode!r}"
+            )
         self._warm_start_diffusion_steps = int(
             getattr(config, "warm_start_diffusion_steps", self._diffusion_steps)
         )
@@ -311,6 +332,17 @@ class Decoder(nn.Module):
     @property
     def sde(self):
         return self._sde
+
+    def clean_prediction_editor_diagnostics(self) -> dict:
+        """Expose detached Step-1 diagnostics after one inference rollout."""
+
+        if self._clean_prediction_editor is None:
+            return {
+                "editor": "disabled",
+                "model_evaluation_count": 0,
+                "calls": [],
+            }
+        return self._clean_prediction_editor.diagnostics()
     
     def forward(self, encoder_outputs, inputs):
         """
@@ -487,21 +519,73 @@ class Decoder(nn.Module):
             if transport_probe is not None:
                 sampling_model_params["transport_injection_probe"] = transport_probe
 
-            x0 = dpm_sampler(
-                self.dit,
-                xT,
-                other_model_params=sampling_model_params,
-                dpm_solver_params={
-                    "correcting_xt_fn": initial_state_constraint,
-                },
-                model_wrapper_params=model_wrapper_params,
-                diffusion_steps=diffusion_steps,
-                sample_params=(
-                    {"t_start": sampling_t_start}
-                    if sampling_t_start is not None
-                    else {}
-                ),
+            # Regression-only diagnostics are opt-in input keys.  They are
+            # absent from normal inference and do not create an editor mode.
+            return_dpm_intermediates = bool(
+                inputs.get("return_dpm_intermediates", False)
             )
+            dual_stream_enabled = bool(inputs.get("dual_stream_enabled", False))
+            if dual_stream_enabled and return_dpm_intermediates:
+                raise ValueError(
+                    "dual_stream_enabled already returns per-evaluation DPM traces; "
+                    "do not also request return_dpm_intermediates"
+                )
+            sampling_params = (
+                {"t_start": sampling_t_start}
+                if sampling_t_start is not None
+                else {}
+            )
+            if return_dpm_intermediates:
+                sampling_params["return_intermediate"] = True
+
+            dual_stream_result = None
+            if dual_stream_enabled:
+                # The diagnostic dual interface must not reuse a mutable editor
+                # instance across streams.  Identity mode can construct two
+                # independent no-op editors; all later editor implementations
+                # must be supplied explicitly by the experiment caller.
+                neutral_editor = inputs.get("neutral_clean_prediction_editor")
+                preference_editor = inputs.get("preference_clean_prediction_editor")
+                if neutral_editor is None and self._clean_prediction_editor_mode == CLEAN_PREDICTION_EDITOR_IDENTITY:
+                    neutral_editor = IdentityCleanPredictionEditor()
+                if preference_editor is None and self._clean_prediction_editor_mode == CLEAN_PREDICTION_EDITOR_IDENTITY:
+                    preference_editor = IdentityCleanPredictionEditor()
+                if neutral_editor is not None and not callable(neutral_editor):
+                    raise TypeError("neutral_clean_prediction_editor must be callable")
+                if preference_editor is not None and not callable(preference_editor):
+                    raise TypeError("preference_clean_prediction_editor must be callable")
+                dual_stream_result = dual_stream_dpm_sampler(
+                    self.dit,
+                    xT,
+                    other_model_params=sampling_model_params,
+                    dpm_solver_params={
+                        "correcting_xt_fn": initial_state_constraint,
+                    },
+                    model_wrapper_params=model_wrapper_params,
+                    diffusion_steps=diffusion_steps,
+                    sample_params=sampling_params,
+                    neutral_editor=neutral_editor,
+                    preference_editor=preference_editor,
+                )
+                x0 = dual_stream_result.preference_sample
+            else:
+                sampling_result = dpm_sampler(
+                    self.dit,
+                    xT,
+                    other_model_params=sampling_model_params,
+                    dpm_solver_params={
+                        "correcting_xt_fn": initial_state_constraint,
+                    },
+                    model_wrapper_params=model_wrapper_params,
+                    diffusion_steps=diffusion_steps,
+                    sample_params=sampling_params,
+                    clean_prediction_editor=self._clean_prediction_editor,
+                    clean_prediction_observer=inputs.get("clean_prediction_observer"),
+                )
+                if return_dpm_intermediates:
+                    x0, dpm_intermediates = sampling_result
+                else:
+                    x0 = sampling_result
             if (
                 self.preference_axis_objective is not None
                 and prepared_axis_diagnostics is not None
@@ -538,6 +622,22 @@ class Decoder(nn.Module):
                     device=x0.device,
                 ),
             }
+            if dual_stream_result is not None:
+                neutral_prediction = self._state_normalizer.inverse(
+                    dual_stream_result.neutral_sample.reshape(B, P, -1, 4)
+                )[:, :, 1:]
+                outputs.update(
+                    {
+                        "dual_stream_neutral_prediction": neutral_prediction,
+                        "dual_stream_preference_prediction": x0,
+                        "dual_stream_result": dual_stream_result,
+                    }
+                )
+            if return_dpm_intermediates:
+                outputs["dpm_intermediates"] = torch.stack(
+                    dpm_intermediates,
+                    dim=0,
+                )
             if temporal_debug is not None:
                 outputs.update(temporal_debug)
             if router_debug is not None:

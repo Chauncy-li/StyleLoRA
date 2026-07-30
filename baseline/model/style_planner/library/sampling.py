@@ -6,9 +6,19 @@
 - 输出去噪后的轨迹样本。
 """
 
+from dataclasses import replace
 from typing import Dict, Iterable, Optional
 import torch
 import baseline.model.style_planner.library.dpm_solver_pytorch as dpm
+from baseline.model.style_planner.preference_flow import (
+    CleanPredictionEditContext,
+    CleanPredictionEditor,
+    CleanPredictionObserver,
+    CleanPredictionTraceRecorder,
+    DualStreamSampleResult,
+    NeutralReferenceCache,
+    apply_clean_prediction_editor,
+)
 
 
 class TransportInjectionProbe:
@@ -126,6 +136,56 @@ def selftest_transport_injection_probe() -> Dict[str, bool]:
     }
 
 
+def _batched_trace_time(
+        diffusion_time,
+        *,
+        reference: torch.Tensor,
+        label: str,
+) -> torch.Tensor:
+    """Normalize a DPM time tensor to exactly one value per batch element."""
+
+    time = torch.as_tensor(
+        diffusion_time,
+        device=reference.device,
+        dtype=reference.dtype,
+    ).reshape(-1)
+    batch_size = int(reference.shape[0])
+    if time.numel() == 1 and batch_size != 1:
+        time = time.expand(batch_size)
+    if time.numel() != batch_size:
+        raise ValueError(
+            f"{label} received a diffusion-time batch of {time.numel()} for "
+            f"state batch size {batch_size}"
+        )
+    if time.numel() > 1 and not torch.allclose(
+        time,
+        time[:1].expand_as(time),
+        atol=1e-7,
+        rtol=0.0,
+    ):
+        raise ValueError(
+            f"all samples in one {label} evaluation must share diffusion time"
+        )
+    return time
+
+
+def _is_terminal_denoise_time(
+        diffusion_time: torch.Tensor,
+        *,
+        terminal_time: float,
+) -> bool:
+    return bool(
+        torch.all(
+            torch.isclose(
+                diffusion_time,
+                torch.full_like(diffusion_time, terminal_time),
+                atol=1e-7,
+                rtol=0.0,
+            )
+        ).item()
+    )
+
+
 def dpm_sampler(
         model: torch.nn.Module,
         x_T,
@@ -135,8 +195,28 @@ def dpm_sampler(
         noise_schedule_params: Dict = {},
         model_wrapper_params: Dict = {},
         dpm_solver_params: Dict = {},
-        sample_params: Dict = {}
+        sample_params: Dict = {},
+        clean_prediction_editor: Optional[CleanPredictionEditor] = None,
+        clean_prediction_observer: Optional[CleanPredictionObserver] = None,
+        neutral_reference_cache: Optional[NeutralReferenceCache] = None,
+        stream_name: str = "single",
 ):
+    """Run one DPM stream with an optional clean-prediction callback.
+
+    When a callback is active, the sampler snapshots the actual DPM state
+    passed to each denoiser evaluation.  The x0 corrector then consumes that
+    matching snapshot immediately after the model has predicted x0.  The
+    default path deliberately installs no callback and preserves the original
+    StylePlanner sampling behavior.
+    """
+
+    if not isinstance(stream_name, str) or not stream_name.strip():
+        raise ValueError("stream_name must be a non-empty string")
+    stream_name = stream_name.strip()
+    if neutral_reference_cache is not None and stream_name != "preference":
+        raise ValueError(
+            "neutral_reference_cache is valid only for the preference DPM stream"
+        )
     with torch.no_grad():
         # Keep the caller's mapping immutable.  Phase-0 injects a mutable
         # diagnostic gate into this local copy immediately before each logical
@@ -176,9 +256,130 @@ def dpm_sampler(
                     )
                 return base_model_fn(x, diffusion_time)
 
+        # DPM-Solver invokes ``correcting_x0_fn`` after converting the wrapped
+        # model output to its DPM-facing clean prediction and immediately before
+        # its update.  Leaving this key absent is intentional: disabled mode
+        # follows the pre-Step-1 sampler path without an extra callback.
+        local_dpm_solver_params = dict(dpm_solver_params)
+        hook_active = (
+            clean_prediction_editor is not None
+            or clean_prediction_observer is not None
+            or neutral_reference_cache is not None
+        )
+        if hook_active:
+            existing_corrector = local_dpm_solver_params.get("correcting_x0_fn")
+            if existing_corrector is not None:
+                raise ValueError(
+                    "clean_prediction_editor cannot be combined with an existing "
+                    "DPM correcting_x0_fn in Step 1"
+                )
+
+            for clean_prediction_hook in (
+                clean_prediction_editor,
+                clean_prediction_observer,
+            ):
+                if clean_prediction_hook is None:
+                    continue
+                reset = getattr(clean_prediction_hook, "reset", None)
+                if callable(reset):
+                    reset()
+            if (
+                clean_prediction_observer is not None
+                and not callable(clean_prediction_observer)
+            ):
+                raise TypeError("clean_prediction_observer must be callable")
+
+            # The solver calls model_fn(x_q, t) immediately before invoking the
+            # x0 corrector.  Capture that exact x_q here, rather than passing a
+            # fixed decoder input through every callback.
+            base_model_fn = model_fn
+            latest_model_state: Optional[torch.Tensor] = None
+            latest_model_time: Optional[torch.Tensor] = None
+            model_evaluation_index = -1
+
+            def model_fn_with_current_state(x, diffusion_time):
+                nonlocal latest_model_state
+                nonlocal latest_model_time
+                nonlocal model_evaluation_index
+                if not torch.is_tensor(x):
+                    raise TypeError("DPM model evaluation state must be a torch.Tensor")
+                model_evaluation_index += 1
+                latest_model_state = x.detach().clone()
+                latest_model_time = _batched_trace_time(
+                    diffusion_time,
+                    reference=x,
+                    label="DPM model",
+                ).detach().clone()
+                return base_model_fn(x, diffusion_time)
+
+            model_fn = model_fn_with_current_state
+            terminal_time = 1.0 / float(noise_schedule.total_N)
+
+            def clean_prediction_corrector(clean_prediction, diffusion_time):
+                if latest_model_state is None or latest_model_time is None:
+                    raise RuntimeError(
+                        "DPM x0 corrector ran without a matching model evaluation state"
+                    )
+                time = _batched_trace_time(
+                    diffusion_time,
+                    reference=clean_prediction,
+                    label="DPM clean-prediction editor",
+                )
+                if tuple(latest_model_state.shape) != tuple(clean_prediction.shape):
+                    raise RuntimeError(
+                        "captured DPM state and clean prediction have different shapes: "
+                        f"{tuple(latest_model_state.shape)} versus "
+                        f"{tuple(clean_prediction.shape)}"
+                    )
+                latest_time = latest_model_time.to(
+                    device=clean_prediction.device,
+                    dtype=clean_prediction.dtype,
+                )
+                if not torch.allclose(time, latest_time, atol=1e-7, rtol=0.0):
+                    raise RuntimeError(
+                        "DPM x0 corrector time does not match its denoiser evaluation"
+                    )
+                is_terminal_denoise = _is_terminal_denoise_time(
+                    time,
+                    terminal_time=terminal_time,
+                )
+                context = CleanPredictionEditContext(
+                    diffusion_time=time,
+                    log_snr=noise_schedule.marginal_lambda(time),
+                    model_evaluation_index=model_evaluation_index,
+                    # The vendored DPM callback has no solver-step parameter;
+                    # do not invent one from NFE order.
+                    solver_step_index=None,
+                    is_terminal_denoise=is_terminal_denoise,
+                    current_state=latest_model_state,
+                    stream_name=stream_name,
+                )
+                if neutral_reference_cache is not None:
+                    context = replace(
+                        context,
+                        neutral_record=neutral_reference_cache.lookup(
+                            evaluation_index=model_evaluation_index,
+                            diffusion_time=context.diffusion_time,
+                            log_snr=context.log_snr,
+                            is_terminal_denoise=context.is_terminal_denoise,
+                        ),
+                    )
+                if clean_prediction_editor is None:
+                    edited_clean_prediction = clean_prediction
+                else:
+                    edited_clean_prediction = apply_clean_prediction_editor(
+                        clean_prediction_editor,
+                        clean_prediction,
+                        context,
+                    )
+                if clean_prediction_observer is not None:
+                    clean_prediction_observer(edited_clean_prediction, context)
+                return edited_clean_prediction
+
+            local_dpm_solver_params["correcting_x0_fn"] = clean_prediction_corrector
 
         dpm_solver = dpm.DPM_Solver(
-            model_fn, noise_schedule, algorithm_type="dpmsolver++", **dpm_solver_params)  # w.o. dynamic thresholding
+            model_fn, noise_schedule, algorithm_type="dpmsolver++", **local_dpm_solver_params)  # w.o. dynamic thresholding
 
         # Steps in [10, 20] can generate quite good samples.
         # And steps = 20 can almost converge.
@@ -193,3 +394,91 @@ def dpm_sampler(
         )
 
     return sample_dpm
+
+
+def dual_stream_dpm_sampler(
+        model: torch.nn.Module,
+        x_T: torch.Tensor,
+        other_model_params: Dict = {},
+        diffusion_steps=10,
+        noise_schedule_params: Dict = {},
+        model_wrapper_params: Dict = {},
+        dpm_solver_params: Dict = {},
+        sample_params: Dict = {},
+        neutral_editor: Optional[CleanPredictionEditor] = None,
+        preference_editor: Optional[CleanPredictionEditor] = None,
+) -> DualStreamSampleResult:
+    """Sample independent neutral and preference DPM streams from one noise draw.
+
+    The streams run sequentially only to make Step 2 easy to audit.  Each call
+    constructs a fresh DPM-Solver and receives its own clone of ``x_T``.  The
+    neutral trace is frozen into a clone-on-read cache before preference
+    sampling, so a preference editor can inspect aligned neutral values without
+    sharing a mutable solver tensor.
+    """
+
+    if not torch.is_tensor(x_T):
+        raise TypeError("x_T must be a torch.Tensor for dual-stream sampling")
+    if bool(sample_params.get("return_intermediate", False)):
+        raise ValueError(
+            "dual_stream_dpm_sampler exposes per-evaluation traces and does not "
+            "support sample_params['return_intermediate']"
+        )
+    if neutral_editor is not None and neutral_editor is preference_editor:
+        raise ValueError(
+            "neutral and preference streams require distinct editor instances; "
+            "pass None for both identity-free streams or construct two editors"
+        )
+
+    neutral_initial_state = x_T.detach().clone()
+    preference_initial_state = x_T.detach().clone()
+    neutral_x_T = x_T.clone()
+    preference_x_T = x_T.clone()
+
+    neutral_recorder = CleanPredictionTraceRecorder()
+    neutral_sample = dpm_sampler(
+        model,
+        neutral_x_T,
+        other_model_params=dict(other_model_params),
+        diffusion_steps=diffusion_steps,
+        noise_schedule_params=dict(noise_schedule_params),
+        model_wrapper_params=dict(model_wrapper_params),
+        dpm_solver_params=dict(dpm_solver_params),
+        sample_params=dict(sample_params),
+        clean_prediction_editor=neutral_editor,
+        clean_prediction_observer=neutral_recorder,
+        stream_name="neutral",
+    )
+    neutral_trace = neutral_recorder.records()
+    neutral_cache = NeutralReferenceCache(neutral_trace)
+
+    preference_recorder = CleanPredictionTraceRecorder()
+    preference_sample = dpm_sampler(
+        model,
+        preference_x_T,
+        other_model_params=dict(other_model_params),
+        diffusion_steps=diffusion_steps,
+        noise_schedule_params=dict(noise_schedule_params),
+        model_wrapper_params=dict(model_wrapper_params),
+        dpm_solver_params=dict(dpm_solver_params),
+        sample_params=dict(sample_params),
+        clean_prediction_editor=preference_editor,
+        clean_prediction_observer=preference_recorder,
+        neutral_reference_cache=neutral_cache,
+        stream_name="preference",
+    )
+    preference_trace = preference_recorder.records()
+
+    if len(preference_trace) != len(neutral_trace):
+        raise RuntimeError(
+            "neutral and preference streams produced different logical DPM "
+            f"evaluation counts: {len(neutral_trace)} versus {len(preference_trace)}"
+        )
+    return DualStreamSampleResult(
+        neutral_sample=neutral_sample,
+        preference_sample=preference_sample,
+        neutral_initial_state=neutral_initial_state,
+        preference_initial_state=preference_initial_state,
+        neutral_trace=neutral_trace,
+        preference_trace=preference_trace,
+    )

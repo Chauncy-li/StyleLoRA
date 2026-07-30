@@ -41,7 +41,7 @@ from tqdm import tqdm
 # -----------------------------------------------------------------------------
 # 环境设置与路径修补
 # -----------------------------------------------------------------------------
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ["HYDRA_FULL_ERROR"] = "0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
