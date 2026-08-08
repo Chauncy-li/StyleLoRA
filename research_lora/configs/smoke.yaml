@@ -1,0 +1,7 @@
+defaults:
+  - default
+training:
+  steps: 10
+  batch_size: 2
+data:
+  num_workers: 0

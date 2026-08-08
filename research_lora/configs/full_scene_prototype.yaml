@@ -1,0 +1,12 @@
+# 方案 B：共享 LoRA + 训练集 scene × style 三轴原型辅助损失。
+# 原有去噪和邻车保持仍为主损失；以下权重仅提供小幅方向性约束。
+defaults:
+  - default
+model:
+  rank: 8
+training:
+  steps: 100000
+  batch_size: 32
+  prototype_weight: 0.02
+  prototype_margin_weight: 0.01
+  prototype_margin: 0.20

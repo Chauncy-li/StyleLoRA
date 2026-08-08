@@ -1,0 +1,7 @@
+defaults:
+  - default
+model:
+  rank: 8
+training:
+  steps: 100000
+  batch_size: 32
