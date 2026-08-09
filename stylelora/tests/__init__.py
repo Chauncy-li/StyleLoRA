@@ -1,0 +1,2 @@
+"""Tests for the CSPQ preference encoder stage."""
+
