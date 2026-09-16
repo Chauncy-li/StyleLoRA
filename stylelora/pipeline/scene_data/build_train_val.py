@@ -1,4 +1,4 @@
-"""Build v2 straight-scene splits from existing train/val planner caches."""
+"""Build v2 straight-scene splits from train/val or held-out test caches."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ SCENE_BUCKETS: Sequence[str] = PRIMARY_SCENE_BUCKETS
 
 DEFAULT_TRAIN_OUTPUT_DIR = Path(DEFAULT_STYLE_SCENE_SPLIT_TRAIN_V2_DIR)
 DEFAULT_VAL_OUTPUT_DIR = Path(DEFAULT_STYLE_SCENE_SPLIT_VAL_V2_DIR)
+DEFAULT_TEST_OUTPUT_DIR = DEFAULT_VAL_OUTPUT_DIR.parent / "style_scene_split_straight_test_simu_v2"
 
 
 def _load_json(path: str) -> Mapping[str, object]:
@@ -136,22 +137,29 @@ def _partition_ranges(manifest: Mapping[str, object]) -> Dict[str, tuple[int, in
     train_num = int(manifest.get("train_num_samples", 0))
     val_start = int(manifest.get("val_start_index", train_start + train_num))
     val_num = int(manifest.get("val_num_samples", 0))
+    # test_simu cache generation is a single-partition job.  Its historical
+    # manifest stores the held-out test population in train_* fields and sets
+    # val_num_samples=0; accept explicit test_* fields as well if introduced.
+    test_start = int(manifest.get("test_start_index", train_start))
+    test_num = int(manifest.get("test_num_samples", manifest.get("scenario_count", train_num)))
     return {
         "train": (train_start, train_start + train_num),
         "val": (val_start, val_start + val_num),
+        "test": (test_start, test_start + test_num),
     }
 
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build train/val straight-scene splits from existing boston_cache_train_val planner caches"
+        description="Build straight-scene splits from train/val or held-out test planner caches"
     )
     parser.add_argument("--planner_cache_dir", type=str, default=str(DEFAULT_CACHE_TRAIN_VAL_DIR))
     parser.add_argument("--data_list_path", type=str, default=str(DEFAULT_CACHE_TRAIN_VAL_LIST_PATH))
     parser.add_argument("--manifest_path", type=str, default=str(DEFAULT_CACHE_TRAIN_VAL_MANIFEST_PATH))
-    parser.add_argument("--split_name", type=str, default="all", choices=["train", "val", "all"])
+    parser.add_argument("--split_name", type=str, default="all", choices=["train", "val", "test", "all"])
     parser.add_argument("--train_output_dir", type=str, default=str(DEFAULT_TRAIN_OUTPUT_DIR))
     parser.add_argument("--val_output_dir", type=str, default=str(DEFAULT_VAL_OUTPUT_DIR))
+    parser.add_argument("--test_output_dir", type=str, default=str(DEFAULT_TEST_OUTPUT_DIR))
     parser.add_argument("--time_delta", type=float, default=0.1)
     parser.add_argument("--skip_existing", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=500)
@@ -169,6 +177,8 @@ def main() -> None:
         run_plan.append(("train", args.train_output_dir))
     if args.split_name in {"val", "all"}:
         run_plan.append(("val", args.val_output_dir))
+    if args.split_name == "test":
+        run_plan.append(("test", args.test_output_dir))
 
     summaries: Dict[str, object] = {
         "planner_cache_dir": args.planner_cache_dir,
@@ -202,5 +212,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

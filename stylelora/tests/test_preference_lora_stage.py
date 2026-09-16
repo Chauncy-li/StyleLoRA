@@ -34,6 +34,8 @@ from stylelora.training.preference_lora import (
     _build_pred_tokens,
     _dynamics_consistency_loss,
     _finite_diff,
+    _interpolation_consistency_loss,
+    _lateral_residual_loss,
     _masked_factor_huber,
     preference_lora_loss,
 )
@@ -66,6 +68,7 @@ class _DummyPlanner(nn.Module):
 
     def __init__(self, d: int = 16) -> None:
         super().__init__()
+        self.forward_calls = 0
         self.to_d = nn.Linear(6, d)
         self.mlp1 = _Mlp(d)
         self.mlp2 = _Mlp(d)
@@ -80,6 +83,7 @@ class _DummyPlanner(nn.Module):
             parameter.requires_grad_(False)
 
     def forward(self, inputs: dict) -> dict:
+        self.forward_calls += 1
         traj = inputs["traj"]                                   # [B, T, 6]
         x = self.to_d(traj.mean(dim=1, keepdim=True))           # [B, 1, d]
         x = self.mlp1(x)                                        # [B, 1, d]
@@ -258,6 +262,95 @@ def test_build_pred_tokens_uses_cos_sin_columns_directly() -> None:
     assert torch.allclose(tokens[:, :, 5], torch.ones(2, 5), atol=1e-5)
 
 
+def test_ict_loss_matches_interpolated_latent_and_stops_endpoint_gradients() -> None:
+    """ICT 命中插值时为零；偏离时仅向中间 latent 回传梯度。"""
+    z_base = torch.ones(3, 4, requires_grad=True)
+    z_endpoint = torch.full((3, 4), 3.0, requires_grad=True)
+    exact_mid = torch.full((3, 4), 2.0, requires_grad=True)
+    exact = _interpolation_consistency_loss(
+        exact_mid, z_base, z_endpoint, torch.tensor(0.5))
+    assert float(exact) < 1e-8
+
+    z_mid = torch.zeros(3, 4, requires_grad=True)
+    loss = _interpolation_consistency_loss(
+        z_mid, z_base, z_endpoint, torch.tensor(0.5))
+    assert float(loss) > 0.0
+    loss.backward()
+    assert z_mid.grad is not None and float(z_mid.grad.abs().sum()) > 0.0
+    assert z_base.grad is None
+    assert z_endpoint.grad is None
+
+
+def test_ict_high_backpropagates_to_lora_and_restores_endpoint() -> None:
+    """High ICT 使用正 rho，梯度回传 LoRA，结束后恢复完整 High 端点。"""
+    planner, cspq, inputs, futures, norm, marginal, batch = _loss_fixture()
+    with torch.no_grad():
+        for _, layer in iter_style_layers(planner.baseline):
+            layer.aggressive.lora_B.normal_(0.0, 0.1)
+    result = preference_lora_loss(
+        planner=planner, cspq=cspq, inputs=inputs, futures=futures,
+        marginal_prob=marginal, state_normalizer=norm, batch=batch, direction="high",
+        lambda_ict=1.0, ict_alpha=1.0,
+    )
+    assert 0.0 < float(result["ict_rho"]) < 1.0
+    assert planner._style == "aggr" and planner._strength == 1.0
+    result["ict"].backward()
+    assert any(
+        parameter.grad is not None and float(parameter.grad.abs().sum()) > 0.0
+        for name, parameter in planner.named_parameters()
+        if ".aggressive.lora_" in name
+    )
+    assert all(parameter.grad is None for parameter in cspq.parameters())
+
+
+def test_ict_low_uses_negative_rho_and_restores_endpoint() -> None:
+    """Low ICT 使用负 rho，并在中间前向后恢复完整 Low 端点。"""
+    planner, cspq, inputs, futures, norm, marginal, batch = _loss_fixture()
+    planner.set_strength(-1.0)
+    result = preference_lora_loss(
+        planner=planner, cspq=cspq, inputs=inputs, futures=futures,
+        marginal_prob=marginal, state_normalizer=norm, batch=batch, direction="low",
+        lambda_ict=1.0, ict_alpha=1.0,
+    )
+    assert -1.0 < float(result["ict_rho"]) < 0.0
+    assert planner._style == "cons" and planner._strength == -1.0
+
+
+def test_lambda_ict_zero_keeps_original_forward_path_and_loss() -> None:
+    """关闭 ICT 时不增加中间前向，且总损失仍严格使用原有公式。"""
+    planner, cspq, inputs, futures, norm, marginal, batch = _loss_fixture()
+    calls_before = planner.baseline.forward_calls
+    result = preference_lora_loss(
+        planner=planner, cspq=cspq, inputs=inputs, futures=futures,
+        marginal_prob=marginal, state_normalizer=norm, batch=batch, direction="high",
+        lambda_n=1.0, lambda_z=1.0, lambda_s=1.0,
+        lambda_dyn=0.1, lambda_q=1.0, lambda_lat=1.0,
+        lambda_ict=0.0,
+    )
+    assert planner.baseline.forward_calls - calls_before == 2
+    assert float(result["ict"]) == 0.0
+    assert float(result["ict_rho"]) == 0.0
+    expected = (result["ego_denoise"] + result["neighbor"] + result["mmd_z"]
+                + result["rank_huber"] + 0.1 * result["dynamics"]
+                + result["factor_huber"] + result["lateral"])
+    assert torch.equal(result["loss"], expected)
+
+
+def test_ict_sampling_is_reproducible_with_fixed_seed() -> None:
+    """相同模型、数据与随机 seed 应得到相同的 Beta 中间强度。"""
+    sampled = []
+    for _ in range(2):
+        planner, cspq, inputs, futures, norm, marginal, batch = _loss_fixture(seed=19)
+        torch.manual_seed(3407)
+        result = preference_lora_loss(
+            planner=planner, cspq=cspq, inputs=inputs, futures=futures,
+            marginal_prob=marginal, state_normalizer=norm, batch=batch, direction="high",
+            lambda_ict=1.0, ict_alpha=0.8,
+        )
+        sampled.append(float(result["ict_rho"]))
+    assert sampled[0] == sampled[1]
+
+
 def _smooth_xy(bsz: int = 2, length: int = 8) -> torch.Tensor:
     """线性匀速 xy 序列 [B, T, 2]（速度恒定 -> 加速度/jerk 全 0）。"""
     t = torch.arange(length, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
@@ -321,6 +414,95 @@ def test_dynamics_acceleration_scale_is_dt_squared() -> None:
     # 匀加速 -> 三阶差分 / dt^3 恒为 0（jerk = 0）
     jerk = _finite_diff(xy, 3) / (dt ** 3)
     assert float(jerk.abs().max()) < 1e-8
+
+
+def _straight_physical_trajectory(bsz: int = 2, length: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+    """构造沿 x 轴行驶的 baseline 物理轨迹及当前帧位置。"""
+    x = torch.arange(1, length + 1, dtype=torch.float32).view(1, length).expand(bsz, -1)
+    y = torch.zeros_like(x)
+    cos = torch.ones_like(x)
+    sin = torch.zeros_like(x)
+    trajectory = torch.stack((x, y, cos, sin), dim=-1)
+    current_xy = torch.zeros(bsz, 1, 2)
+    return trajectory, current_xy
+
+
+def test_lateral_residual_zero_for_baseline_and_longitudinal_change() -> None:
+    """相同轨迹以及纯纵向变化均不应被误判为横向偏移。"""
+    base, current_xy = _straight_physical_trajectory()
+    identical = _lateral_residual_loss(base, base, base, current_xy, tolerance=0.3)
+    assert float(identical["lateral"]) == 0.0
+
+    longitudinal = base.clone()
+    longitudinal[..., 0] += 0.8
+    changed = _lateral_residual_loss(longitudinal, base, base, current_xy, tolerance=0.3)
+    assert float(changed["lateral"]) < 1e-7
+
+
+def test_lateral_residual_penalizes_only_offset_beyond_tolerance() -> None:
+    """容差内的平滑横移不罚，超过容差的横移产生正损失。"""
+    base, current_xy = _straight_physical_trajectory()
+    within = base.clone()
+    within[..., 1] += 0.2
+    within_loss = _lateral_residual_loss(within, base, base, current_xy, tolerance=0.3)
+    assert float(within_loss["lateral_offset"]) == 0.0
+
+    excessive = base.clone()
+    excessive[..., 1] += 0.6
+    excessive_loss = _lateral_residual_loss(excessive, base, base, current_xy, tolerance=0.3)
+    assert float(excessive_loss["lateral_offset"]) > 0.0
+    assert torch.allclose(excessive_loss["lateral_max_abs"], torch.tensor(0.6), atol=1e-6)
+
+
+def test_lateral_residual_does_not_penalize_improvement_over_baseline() -> None:
+    """LoRA 横向误差小于 baseline 时，即使两者轨迹不同也不惩罚。"""
+    expert, current_xy = _straight_physical_trajectory()
+    base = expert.clone()
+    base[..., 1] += 0.6
+    adaptive = expert.clone()
+    adaptive[..., 1] += 0.2
+    result = _lateral_residual_loss(adaptive, base, expert, current_xy, tolerance=0.1)
+    assert float(result["lateral_offset"]) == 0.0
+
+
+def test_lateral_residual_topk_keeps_rare_large_error() -> None:
+    """TopK 均值应保留少数严重横向误差，不能被其余正常帧稀释。"""
+    base, current_xy = _straight_physical_trajectory(bsz=1, length=10)
+    adaptive = base.clone()
+    adaptive[:, 0, 1] = 1.0
+    result = _lateral_residual_loss(
+        adaptive, base, base, current_xy, tolerance=0.1, topk_ratio=0.2)
+    # 最差 20% 为 2 帧：一帧损失 (1.0-0.1)^2，另一帧为 0。
+    assert torch.allclose(result["lateral_offset"], torch.tensor(0.405), atol=1e-6)
+
+
+def test_lateral_residual_detects_jitter_and_backpropagates() -> None:
+    """交替横摆应触发平滑项，且损失能够向 LoRA 预测轨迹反传梯度。"""
+    base, current_xy = _straight_physical_trajectory()
+    adaptive = base.clone()
+    adaptive[:, ::2, 1] += 0.5
+    adaptive[:, 1::2, 1] -= 0.5
+    adaptive.requires_grad_(True)
+    result = _lateral_residual_loss(adaptive, base, base, current_xy, tolerance=0.3)
+    assert float(result["lateral_smoothness"]) > 0.0
+    result["lateral"].backward()
+    assert adaptive.grad is not None
+    assert float(adaptive.grad.abs().sum()) > 0.0
+
+
+def test_lambda_lat_zero_recovers_previous_total_loss() -> None:
+    """lambda_lat=0 时不改变现有三因子与动力学训练目标。"""
+    planner, cspq, inputs, futures, norm, marginal, batch = _loss_fixture()
+    result = preference_lora_loss(
+        planner=planner, cspq=cspq, inputs=inputs, futures=futures,
+        marginal_prob=marginal, state_normalizer=norm, batch=batch, direction="high",
+        lambda_n=1.0, lambda_z=1.0, lambda_s=1.0, lambda_dyn=0.1, lambda_q=1.0,
+        lambda_lat=0.0,
+    )
+    expected = (result["ego_denoise"] + result["neighbor"] + result["mmd_z"]
+                + result["rank_huber"] + 0.1 * result["dynamics"]
+                + result["factor_huber"])
+    assert torch.allclose(result["loss"], expected.detach(), atol=1e-5)
 
 
 def test_lambda_q_zero_recovers_loss_without_factor() -> None:
@@ -545,10 +727,21 @@ if __name__ == "__main__":
     test_rho_zero_identity_equals_frozen_baseline()
     test_preference_lora_loss_inverse_on_full_agent_dim()
     test_build_pred_tokens_uses_cos_sin_columns_directly()
+    test_ict_loss_matches_interpolated_latent_and_stops_endpoint_gradients()
+    test_ict_high_backpropagates_to_lora_and_restores_endpoint()
+    test_ict_low_uses_negative_rho_and_restores_endpoint()
+    test_lambda_ict_zero_keeps_original_forward_path_and_loss()
+    test_ict_sampling_is_reproducible_with_fixed_seed()
     test_dynamics_loss_near_zero_when_pred_equals_gt()
     test_dynamics_loss_jerk_increases_with_alternating_jitter()
     test_dynamics_loss_backpropagates_to_prediction()
     test_dynamics_acceleration_scale_is_dt_squared()
+    test_lateral_residual_zero_for_baseline_and_longitudinal_change()
+    test_lateral_residual_penalizes_only_offset_beyond_tolerance()
+    test_lateral_residual_does_not_penalize_improvement_over_baseline()
+    test_lateral_residual_topk_keeps_rare_large_error()
+    test_lateral_residual_detects_jitter_and_backpropagates()
+    test_lambda_lat_zero_recovers_previous_total_loss()
     test_lambda_q_zero_recovers_loss_without_factor()
     test_factor_huber_zero_when_all_masked()
     test_factor_huber_near_zero_when_q_hat_matches_q_vec()
@@ -556,5 +749,3 @@ if __name__ == "__main__":
     test_lambda_dyn_zero_recovers_original_loss()
     test_lora_zero_strength_identity_layer_level()
     print("All preference-lora stage tests passed.")
-
-

@@ -24,7 +24,7 @@ from stylelora.lora.data.schema import StyleSample
 BASELINE_TENSOR_KEYS = (
     "ego_current_state", "neighbor_agents_past", "lanes", "lanes_speed_limit", "lanes_has_speed_limit",
     "route_lanes", "route_lanes_speed_limit", "route_lanes_has_speed_limit", "static_objects",
-    "neighbor_agents_past_mask", "neighbor_agents_future_mask",
+    "lanes_mask", "route_lanes_mask", "neighbor_agents_past_mask", "neighbor_agents_future_mask",
 )
 
 
@@ -138,4 +138,3 @@ def style_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         raise ValueError("Cache tensor keys differ inside one batch")
     return {"tensors": default_collate([sample["tensors"] for sample in samples]),
             "metadata": [sample["metadata"] for sample in samples]}
-

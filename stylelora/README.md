@@ -256,20 +256,37 @@ python -m stylelora.scripts.evaluate_open_loop \
 
 ### 步骤 12：NuPlan 闭环验证
 
+正式闭环实验应先对 held-out test cache 运行 `build_scene_split --split_name test`，
+再从 test `split_index.jsonl` 生成所有 rho 共用的场景均衡 token 列表：
+
+```bash
+python -m stylelora.scripts.select_closed_loop_scenarios \
+  --split-index /path/to/test_scene_split/split_index.jsonl \
+  --output /path/to/reports/closed_loop_tokens.json \
+  --per-scene 25 \
+  --min-scene-confidence 0.8
+```
+
+再运行固定场景上的多 rho 仿真：
+
 ```bash
 python -m stylelora.scripts.evaluate_closed_loop \
   --args-file /path/to/baseline_args.json \
   --baseline-checkpoint /path/to/baseline.ckpt \
   --high-adapter /path/to/lora/preference_high.pt \
   --low-adapter /path/to/lora/preference_low.pt \
-  --normalization-file /path/to/normalization.json \
+  --data-root /path/to/nuplan/splits/train_boston \
+  --maps-root /path/to/nuplan/maps \
+  --scenario-filter boston \
+  --scenario-tokens-file /path/to/reports/closed_loop_tokens.json \
   --output-root /path/to/reports/closed_loop \
-  --config-root /path/to/repo/baseline/config \
-  --nuplan-overrides-json '["scenario_builder=nuplan", "scenario_filter=..."]'
+  --rhos=-1,-0.5,0,0.5,1
 ```
 
 闭环入口会对多个 `rho` 分别启动 NuPlan simulation，使用
-`stylelora/config/planner/lora_diffusion_planner.yaml`，最后汇总碰撞、可行驶区域、TTC 和舒适性指标。
+`stylelora/config/planner/lora_diffusion_planner.yaml`。所有 rho 使用同一组 token；
+最终同时汇总碰撞、进度、可行驶区域、TTC、舒适性，以及速度、加减速、
+jerk、前车间距和时距的闭环风格响应。`rho=0` 是基线保持参照。
 
 ## 5. 删除旧目录前的检查
 
@@ -298,3 +315,24 @@ rg -n "^(from|import) (research_lora_2|research_lora|research_v1|research_v2)" s
 | `scripts/build_preference_source_manifest.py` | 新增的 scene split → 无标签偏好接口 |
 
 `research_v2/style_prototype_residual` 没有进入当前 StyleLoRA 调用链，因此没有混入正式包。它属于另一条 prototype residual 实验线。
+
+## 7. Ordered Feasible V4（RESULTS3）
+
+V4 从 `CAST_EAAI_PAPER_RESULTS2/MODELS/BOUNDED_CONDITIONAL_V2` 继续训练，包含：
+
+- 顺序损失按实际可行 pair 的置信权重和归一化；
+- 75% 的顺序样本监督九点 rho 网格中的相邻强度，25% 保留跨 Low/High 的全局顺序；
+- 对超出动力学、进度和横向偏移预算的候选施加可微软惩罚；
+- 暂不启用 scene gate；
+- 全量开环报告新增风格跨度、样本平均斜率、有效控制覆盖率和相对 rho=0 的性能代价。
+
+远程服务器一键运行（只到全量开环）：
+
+```bash
+cd /home/lisw/programs/Nuplan-Diffusion-Baseline
+bash stylelora/scripts/run_ordered_feasible_v4.sh
+```
+
+所有模型、日志、状态和开环结果默认写入
+`/mnt/mydata/lishangwen/Nuplan-Baseline-Record/CAST_EAAI_PAPER_RESULTS3`。可用
+`CAST_GPU` 选择物理 GPU，用 `CAST_START_STEP=2` 或 `3` 从训练或开环步骤恢复。

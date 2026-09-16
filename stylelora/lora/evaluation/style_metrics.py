@@ -82,6 +82,285 @@ def _route_speed_limit(route_limits: torch.Tensor, route_has_limits: torch.Tenso
     return None
 
 
+def _polyline_segment_geometry(
+    polylines: torch.Tensor,
+    point_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Return valid lane segments as starts, vectors, and approximate half widths."""
+    if polylines.ndim != 3 or polylines.shape[1] < 2 or polylines.shape[2] < 2:
+        return None
+    values = polylines.float()
+    starts = values[:, :-1, :2]
+    vectors = values[:, 1:, :2] - starts
+    length = torch.linalg.vector_norm(vectors, dim=-1)
+    valid = torch.isfinite(starts).all(dim=-1) & torch.isfinite(vectors).all(dim=-1) & (length > 1e-4)
+    if point_mask is not None and point_mask.shape == polylines.shape[:2]:
+        mask = point_mask.bool()
+        valid = valid & mask[:, :-1] & mask[:, 1:]
+    if not valid.any():
+        return None
+    if values.shape[2] >= 8:
+        left = torch.linalg.vector_norm(values[:, :, 4:6], dim=-1)
+        right = torch.linalg.vector_norm(values[:, :, 6:8], dim=-1)
+        half_width = 0.5 * (torch.maximum(left[:, :-1], right[:, :-1])
+                            + torch.maximum(left[:, 1:], right[:, 1:]))
+    else:
+        half_width = length.new_full(length.shape, 1.75)
+    return starts[valid], vectors[valid], half_width[valid].clamp_min(0.5)
+
+
+def _nearest_polyline_segment(
+    points: torch.Tensor,
+    polylines: torch.Tensor,
+    point_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    geometry = _polyline_segment_geometry(polylines, point_mask)
+    if geometry is None or points.numel() == 0:
+        return None
+    starts, vectors, half_width = geometry
+    squared_length = vectors.square().sum(dim=-1).clamp_min(1e-8)
+    relative = points[:, None, :] - starts[None, :, :]
+    ratio = (relative * vectors[None, :, :]).sum(dim=-1) / squared_length[None, :]
+    projection = starts[None, :, :] + ratio.clamp(0.0, 1.0)[..., None] * vectors[None, :, :]
+    distance = torch.linalg.vector_norm(points[:, None, :] - projection, dim=-1)
+    nearest = distance.argmin(dim=1)
+    tangent = vectors[nearest] / torch.linalg.vector_norm(vectors[nearest], dim=-1, keepdim=True).clamp_min(1e-6)
+    point_index = torch.arange(points.shape[0], device=points.device)
+    return distance[point_index, nearest], tangent, half_width[nearest]
+
+
+def _state_direction(states: torch.Tensor) -> torch.Tensor:
+    if states.shape[-1] >= 4:
+        direction = states[..., 2:4]
+    elif states.shape[-1] >= 3:
+        direction = torch.stack((torch.cos(states[..., 2]), torch.sin(states[..., 2])), dim=-1)
+    else:
+        direction = torch.zeros((*states.shape[:-1], 2), dtype=states.dtype, device=states.device)
+        direction[..., 0] = 1.0
+    return direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def _vehicle_disc_geometry(
+    states: torch.Tensor,
+    *,
+    length: torch.Tensor,
+    width: torch.Tensor,
+    rear_axle_origin: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Approximate oriented boxes with three longitudinal discs."""
+    length = length.clamp_min(0.5)
+    width = width.clamp_min(0.3)
+    fractions = states.new_tensor((1.0 / 6.0, 0.5, 5.0 / 6.0))
+    offset_length = length
+    while offset_length.ndim < states.ndim - 1:
+        offset_length = offset_length.unsqueeze(-1)
+    if rear_axle_origin:
+        offsets = -1.127 + offset_length[..., None] * fractions
+    else:
+        offsets = offset_length[..., None] * (fractions - 0.5)
+    direction = _state_direction(states)
+    centers = states[..., None, :2] + direction[..., None, :] * offsets[..., None]
+    radius = torch.sqrt((width / 2.0).square() + (length / 6.0).square())
+    return centers, radius
+
+
+def open_loop_behavior_metrics(
+    *,
+    ego_future: torch.Tensor,
+    ego_current: torch.Tensor,
+    neighbors_past: torch.Tensor,
+    neighbors_future: torch.Tensor,
+    neighbor_future_valid_mask: torch.Tensor | None = None,
+    route_lanes: torch.Tensor | None = None,
+    route_lanes_mask: torch.Tensor | None = None,
+    lanes: torch.Tensor | None = None,
+    lanes_mask: torch.Tensor | None = None,
+    static_objects: torch.Tensor | None = None,
+    dt: float = 0.1,
+) -> dict[str, float | bool | None]:
+    """Compute unit-valued behavior and safety proxies for one open-loop rollout.
+
+    Route progress and drivable-area values are cache-geometry proxies. Collision
+    uses generated ego poses against ground-truth neighbor futures and cached
+    static objects; none of these proxy values is a closed-loop NuPlan score.
+    """
+    full_xy = torch.cat((ego_current[:2].reshape(1, 2), ego_future[:, :2]), dim=0).float()
+    speed, acceleration, jerk = _kinematics(full_xy, dt)
+    progress = torch.linalg.vector_norm(torch.diff(full_xy, dim=0), dim=-1).sum()
+    result: dict[str, float | bool | None] = {
+        "planned_mean_speed_mps": float(speed.mean()) if speed.numel() else 0.0,
+        "planned_progress_m": float(progress),
+        "planned_accel_p90_mps2": float(_p90_positive(acceleration)),
+        "planned_decel_p90_mps2": float(_p90_negative(acceleration)),
+        "planned_abs_jerk_p90_mps3": (
+            float(torch.quantile(jerk.abs(), 0.9)) if jerk.numel() else 0.0
+        ),
+    }
+
+    route_geometry = (
+        _nearest_polyline_segment(
+            0.5 * (full_xy[:-1] + full_xy[1:]),
+            route_lanes.float(),
+            route_lanes_mask,
+        )
+        if route_lanes is not None else None
+    )
+    if route_geometry is None:
+        result.update({"route_aligned_progress_m": None, "route_alignment_valid": False})
+    else:
+        _, route_tangent, _ = route_geometry
+        route_progress = (torch.diff(full_xy, dim=0) * route_tangent).sum(dim=-1).sum()
+        result.update({
+            "route_aligned_progress_m": float(route_progress),
+            "route_alignment_valid": True,
+        })
+
+    lane_geometry = (
+        _nearest_polyline_segment(
+            ego_future[:, :2].float(), lanes.float(), lanes_mask
+        )
+        if lanes is not None else None
+    )
+    if lane_geometry is None:
+        result.update({
+            "drivable_area_proxy_fraction": None,
+            "offroad_proxy_fraction": None,
+            "drivable_area_proxy_valid": False,
+        })
+    else:
+        lane_distance, _, lane_half_width = lane_geometry
+        # A center-point-only check is too permissive. Reserve half the Pacifica
+        # width inside the approximate left/right lane-boundary corridor.
+        drivable = lane_distance + (2.297 / 2.0) <= lane_half_width
+        result.update({
+            "drivable_area_proxy_fraction": float(drivable.float().mean()),
+            "offroad_proxy_fraction": float((~drivable).float().mean()),
+            "drivable_area_proxy_valid": True,
+        })
+
+    neighbor_count = min(neighbors_past.shape[0], neighbors_future.shape[0])
+    future_steps = min(ego_future.shape[0], neighbors_future.shape[1]) if neighbor_count else 0
+    dynamic_clearance: torch.Tensor | None = None
+    min_gap: float | None = None
+    min_headway: float | None = None
+    min_ttc: float | None = None
+    lead_valid = False
+    if neighbor_count and future_steps:
+        neighbor_future = neighbors_future[:neighbor_count, :future_steps].float()
+        neighbor_current = neighbors_past[:neighbor_count, -1].float()
+        if neighbor_future_valid_mask is None:
+            future_valid = neighbor_future[..., :2].abs().sum(dim=-1) > 1e-4
+        else:
+            future_valid = neighbor_future_valid_mask[:neighbor_count, :future_steps].bool()
+            future_valid = future_valid & torch.isfinite(neighbor_future[..., :2]).all(dim=-1)
+
+        ego_states = ego_future[:future_steps].float()
+        ego_length = ego_states.new_tensor(5.176)
+        ego_width = ego_states.new_tensor(2.297)
+        ego_centers, ego_radius = _vehicle_disc_geometry(
+            ego_states, length=ego_length, width=ego_width, rear_axle_origin=True
+        )
+        neighbor_length = (
+            neighbor_current[:, 7].clamp_min(0.5)
+            if neighbor_current.shape[-1] > 7 else neighbor_current.new_full((neighbor_count,), 4.5)
+        )
+        neighbor_width = (
+            neighbor_current[:, 6].clamp_min(0.3)
+            if neighbor_current.shape[-1] > 6 else neighbor_current.new_full((neighbor_count,), 2.0)
+        )
+        neighbor_centers, neighbor_radius = _vehicle_disc_geometry(
+            neighbor_future,
+            length=neighbor_length,
+            width=neighbor_width,
+            rear_axle_origin=False,
+        )
+        delta = (ego_centers[None, :, :, None, :]
+                 - neighbor_centers[:, :, None, :, :])
+        clearance = torch.linalg.vector_norm(delta, dim=-1) - (
+            ego_radius + neighbor_radius[:, None, None, None]
+        )
+        clearance = clearance.masked_fill(~future_valid[:, :, None, None], float("inf"))
+        finite_clearance = clearance[torch.isfinite(clearance)]
+        if finite_clearance.numel():
+            dynamic_clearance = finite_clearance.min()
+
+        neighbor_full_xy = torch.cat(
+            (neighbor_current[:, None, :2], neighbor_future[..., :2]), dim=1
+        )
+        neighbor_velocity = torch.diff(neighbor_full_xy, dim=1) / float(dt)
+        ego_velocity = torch.diff(full_xy[:future_steps + 1], dim=0) / float(dt)
+        ego_direction = _state_direction(ego_states)
+        relative = neighbor_future[..., :2] - ego_states[None, :, :2]
+        longitudinal = (relative * ego_direction[None, :, :]).sum(dim=-1)
+        lateral_direction = torch.stack((-ego_direction[:, 1], ego_direction[:, 0]), dim=-1)
+        lateral = (relative * lateral_direction[None, :, :]).sum(dim=-1).abs()
+        lateral_limit = 0.5 * (ego_width + neighbor_width[:, None]) + 0.5
+        lead_candidate = future_valid & (longitudinal > 0) & (lateral <= lateral_limit)
+        bumper_gap = longitudinal - 4.049 - 0.5 * neighbor_length[:, None]
+        masked_gap = bumper_gap.masked_fill(~lead_candidate, float("inf"))
+        step_gap, step_lead_index = masked_gap.min(dim=0)
+        step_has_lead = torch.isfinite(step_gap)
+        if step_has_lead.any():
+            step_index = torch.arange(future_steps, device=step_lead_index.device)
+            lead_longitudinal_speed_all = (
+                neighbor_velocity * ego_direction[None, :, :]
+            ).sum(dim=-1)
+            lead_longitudinal_speed = lead_longitudinal_speed_all[
+                step_lead_index.clamp_max(neighbor_count - 1), step_index
+            ]
+            ego_longitudinal_speed = (ego_velocity * ego_direction).sum(dim=-1)
+            valid_gap = step_gap[step_has_lead]
+            valid_ego_speed = ego_longitudinal_speed[step_has_lead]
+            valid_closing_speed = (
+                ego_longitudinal_speed - lead_longitudinal_speed
+            )[step_has_lead]
+            headway = valid_gap.clamp_min(0.0) / valid_ego_speed.clamp_min(0.1)
+            ttc_valid = (valid_gap <= 0.0) | (valid_closing_speed > 0.1)
+            ttc = torch.where(
+                valid_gap <= 0.0,
+                torch.zeros_like(valid_gap),
+                valid_gap / valid_closing_speed.clamp_min(0.1),
+            )
+            min_gap = float(valid_gap.min())
+            min_headway = float(headway.min())
+            min_ttc = float(ttc[ttc_valid].min()) if ttc_valid.any() else None
+            lead_valid = True
+
+    static_clearance: torch.Tensor | None = None
+    if static_objects is not None and static_objects.ndim == 2 and static_objects.shape[-1] >= 6:
+        static = static_objects.float()
+        static_valid = (static[:, 4] > 0.3) & (static[:, 5] > 0.5)
+        if static_valid.any() and ego_future.numel():
+            static = static[static_valid]
+            ego_centers, ego_radius = _vehicle_disc_geometry(
+                ego_future.float(),
+                length=ego_future.new_tensor(5.176),
+                width=ego_future.new_tensor(2.297),
+                rear_axle_origin=True,
+            )
+            static_centers, static_radius = _vehicle_disc_geometry(
+                static[:, :4], length=static[:, 5], width=static[:, 4], rear_axle_origin=False
+            )
+            delta = ego_centers[None, :, :, None, :] - static_centers[:, None, None, :, :]
+            clearance = torch.linalg.vector_norm(delta, dim=-1) - (
+                ego_radius + static_radius[:, None, None, None]
+            )
+            static_clearance = clearance.min()
+
+    clearance_values = [value for value in (dynamic_clearance, static_clearance) if value is not None]
+    minimum_clearance = min(float(value) for value in clearance_values) if clearance_values else None
+    result.update({
+        "min_lead_gap_m": min_gap,
+        "min_time_headway_s": min_headway,
+        "min_ttc_s": min_ttc,
+        "lead_metric_valid": lead_valid,
+        "ttc_closing_event": min_ttc is not None,
+        "min_collision_clearance_m": minimum_clearance,
+        "collision_proxy": bool(minimum_clearance is not None and minimum_clearance <= 0.0),
+    })
+    return result
+
+
 def scene_style_vector(*, scene: str, ego_future: torch.Tensor, ego_current: torch.Tensor,
                        neighbors_past: torch.Tensor, neighbors_future: torch.Tensor,
                        route_limits: torch.Tensor, route_has_limits: torch.Tensor,
@@ -250,5 +529,3 @@ def aggregate_style_evaluation(records: Sequence[Mapping[str, object]], referenc
                        "target_mean_style_vector": reference.mean(dim=0).tolist(), "axis_names": axes,
                        "metric_space": "generated_trajectory_proxy_axes"})
     return result
-
-

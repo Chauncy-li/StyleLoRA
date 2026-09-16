@@ -73,13 +73,15 @@ def _spearman_mae(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
 
 @torch.no_grad()
 def _collect(model: CSPQPreferenceEncoder, ds: PreferenceEncoderDataset, device: torch.device,
-             batch_size: int, workers: int) -> Dict[str, np.ndarray]:
+             batch_size: int, workers: int, progress_label: str | None = None) -> Dict[str, np.ndarray]:
     """全量顺序遍历数据集（不使用平衡采样器），前向收集指标与 latent。"""
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=workers,
                         collate_fn=encoder_collate)
     model.eval()
     records = {"s": [], "q_hat": [], "z": [], "rank": [], "q_vec": [], "valid": [], "scene": [], "key": []}
-    for batch in loader:
+    total_batches = len(loader)
+    progress_interval = max(1, total_batches // 20)
+    for batch_index, batch in enumerate(loader, start=1):
         traj = batch["trajectory"].to(device)
         hc = batch["h_c"].to(device)
         out = model(traj, hc)
@@ -91,6 +93,14 @@ def _collect(model: CSPQPreferenceEncoder, ds: PreferenceEncoderDataset, device:
         records["valid"].append(batch["valid_mask"].cpu().numpy())
         records["scene"].append(batch["scene_id"].cpu().numpy())
         records["key"].extend(batch["key"])
+        if progress_label and (
+            batch_index == 1 or batch_index == total_batches or batch_index % progress_interval == 0
+        ):
+            print(
+                f"[progress] {progress_label}: {batch_index}/{total_batches} "
+                f"({batch_index / max(total_batches, 1):.1%})",
+                flush=True,
+            )
     return {k: (np.concatenate(v, axis=0) if k != "key" else v) for k, v in records.items()}
 
 
@@ -306,4 +316,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

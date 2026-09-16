@@ -4,7 +4,7 @@
 
 - 使用 ``load_plain_baseline`` 加载原始 baseline（不含任何 LoRA 适配器），
   全程 no_grad + eval，确保特征与冻结基座完全一致；
-- 通过注册到 ``Encoder.fusion`` 的 forward hook 捕获 key_padding_mask；
+- 复用统一场景表征函数捕获 ``Encoder.fusion`` 的 key_padding_mask；
 - 对 encoder 输出的场景 token 特征 ``encoding`` [B, token_num, D] 做
   masked mean pooling，得到每条样本的 ``h_c ∈ R^{D}``；
 - 输出 ``features.npy``（N×D）+ ``feature_index.jsonl``（行序对齐），
@@ -28,65 +28,13 @@ from stylelora.lora.data.dataset import style_collate
 from stylelora.lora.runtime import load_plain_baseline, prepare_diffusion_batch
 
 from stylelora.data.loader import CacheOnlyDataset
+from stylelora.model.scene_context import encode_scene_context
 from stylelora.paths import (
     DEFAULT_FEATURE_INDEX,
     DEFAULT_FEATURE_NPY,
     DEFAULT_PREFERENCE_MANIFEST,
     ensure_repo_on_path,
 )
-
-
-class FrozenSceneFeatureExtractor:
-    """通过 hook 捕获 FusionEncoder 的 mask，并对场景 token 做 masked mean pooling。
-
-    h_c 定义：场景 token 集合（邻居/静态物体/车道）在冻结扩散编码器融合后的
-    输出 'encoding'，按 key_padding_mask 排除无效 token 后的均值向量。
-    """
-
-    def __init__(self, model: torch.nn.Module) -> None:
-        self.model = model
-        self._mask: torch.Tensor | None = None
-        # FusionEncoder.forward(x, mask) 的 mask 是 key_padding_mask（True=pad）
-        # hook 捕获的是调用时传入的 mask 引用；FusionEncoder 内部会 in-place 把
-        # 首个 token（自车索引）置为有效，因此捕获到的 mask 已含该修正。
-        self._fusion = model.encoder.encoder.fusion
-        self._handle = self._fusion.register_forward_hook(self._capture_mask)
-
-    def _capture_mask(self, module, args, output) -> None:
-        # args = (x, mask); 只取 mask
-        if len(args) >= 2:
-            self._mask = args[1]
-
-    @torch.no_grad()
-    def extract_batch(self, model_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        """对一批归一化输入前向冻结 encoder，返回 masked-mean h_c [B, D]。
-
-        Args:
-            model_inputs: observation_normalizer 处理后的模型输入字典。
-
-        Returns:
-            [B, D] 张量（CPU）。
-
-        Raises:
-            RuntimeError: hook 未捕获到 mask（模型结构变化），或输出形状不一致。
-        """
-        self.model.eval()
-        self._mask = None
-        encoder_outputs = self.model.encoder(model_inputs)
-        encoding = encoder_outputs["encoding"]  # [B, token_num, D]
-        mask = self._mask
-        if mask is None:
-            raise RuntimeError("FusionEncoder hook did not capture a mask; verify baseline Encoder structure")
-        if mask.shape[0] != encoding.shape[0] or mask.shape[1] != encoding.shape[1]:
-            raise RuntimeError(
-                f"Mask shape {tuple(mask.shape)} does not match encoding {tuple(encoding.shape)}"
-            )
-        valid = ~mask.bool()  # True = 有效 token
-        counts = valid.sum(dim=-1, keepdim=True).clamp_min(1)
-        feature = (encoding * valid.unsqueeze(-1).float()).sum(dim=1) / counts
-        self._mask = None
-        return feature.detach().cpu().to(dtype=torch.float32)
-
 
 def _iter_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as handle:
@@ -129,7 +77,6 @@ def main() -> None:
     device = torch.device(args.device)
     model, config = load_plain_baseline(args.args_file, args.baseline_checkpoint, args.device)
     model = model.to(device).eval()
-    extractor = FrozenSceneFeatureExtractor(model)
 
     dataset = CacheOnlyDataset(args.manifest, root=args.cache_root,
                                predicted_neighbor_num=config.predicted_neighbor_num)
@@ -144,8 +91,8 @@ def main() -> None:
             metadata = batch.get("metadata") or []
             prepared = prepare_diffusion_batch(batch, device, config.observation_normalizer)
             model_inputs = prepared[0]
-            feature = extractor.extract_batch(model_inputs)  # [B, D] CPU
-            feature = feature.numpy()
+            _, feature = encode_scene_context(model, model_inputs)
+            feature = feature.detach().cpu().to(dtype=torch.float32).numpy()
             for i, meta in enumerate(metadata):
                 index_rows.append({
                     "fid": str(total + i),
@@ -214,4 +161,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

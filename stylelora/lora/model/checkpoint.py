@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -11,12 +12,20 @@ import torch
 from stylelora.lora.model.style_lora_planner import StyleLoRAPlanner
 
 
-def sha256_file(path: str | Path) -> str:
+@lru_cache(maxsize=16)
+def _sha256_file_cached(resolved_path: str, size: int, mtime_ns: int) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with Path(resolved_path).open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def sha256_file(path: str | Path) -> str:
+    """Hash an immutable experiment artifact once per process/stat signature."""
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return _sha256_file_cached(str(resolved), int(stat.st_size), int(stat.st_mtime_ns))
 
 
 def save_adapter_checkpoint(path: str | Path, planner: StyleLoRAPlanner, *, style: str,
@@ -69,5 +78,4 @@ def load_adapter_checkpoint(path: str | Path, planner: StyleLoRAPlanner, *, base
         raise RuntimeError("Injection-layer mismatch between adapter checkpoint and current wrapper")
     planner.load_adapter_state_dict(payload["adapter_state"], metadata["style"])
     return metadata
-
 

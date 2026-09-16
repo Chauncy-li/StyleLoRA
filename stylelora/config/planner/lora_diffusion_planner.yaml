@@ -11,7 +11,38 @@ lora_diffusion_planner:
     lora_conservative_adapter: ???
     lora_normalization_file: ""
     lora_rank: 4
+    lora_alpha: null
     lora_rho: 0.0
+    feedback_rho_step: 0.25
+    # 默认关闭，确保旧命令与旧 checkpoint 的行为不变。
+    conditional_router_enabled: false
+    conditional_router_checkpoint: ""
+    scene_gate_enabled: false
+    scene_gate_checkpoint: ""
+    # 新主线不使用场景门控：按有限强度集合验证候选，全部失败时回退 baseline。
+    bounded_style_enabled: false
+    bounded_candidate_ratios: [1.0, 0.75, 0.5, 0.25]
+    bounded_max_mean_accel_degradation: 0.5
+    bounded_max_mean_jerk_degradation: 2.0
+    bounded_max_progress_loss_m: 2.0
+    bounded_max_lateral_deviation_m: 1.5
+    # Optional inference-only trajectory repair. Disabled preserves the existing planner exactly.
+    trajectory_repair_enabled: false
+    # "legacy" preserves the previous full-validator grid search exactly.
+    # "collision_parallel" checks a short collision horizon and interpolates all fallback candidates in one batch.
+    trajectory_repair_mode: legacy
+    trajectory_repair_longitudinal_scales: [1.0, 0.75, 0.5, 0.25, 0.0]
+    trajectory_repair_lateral_scales: [1.0, 0.75, 0.5, 0.25, 0.0]
+    trajectory_repair_max_mean_lateral_deviation_m: 0.5
+    trajectory_repair_max_offroad_fraction: 0.0
+    trajectory_repair_max_wrong_way_fraction: 0.05
+    trajectory_repair_min_clearance_m: 0.5
+    collision_repair_scales: [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0]
+    collision_repair_horizon_s: 2.0
+    collision_repair_min_clearance_m: 0.5
+    # Optional short-horizon road-footprint check for collision_parallel mode.
+    repair_check_drivable_area: false
+    repair_drivable_horizon_s: 2.0
     guidance_fn: null
   ckpt_path: ???
   past_trajectory_sampling:
@@ -25,4 +56,3 @@ lora_diffusion_planner:
     num_poses: 80
     time_horizon: 8
   device: cuda
-

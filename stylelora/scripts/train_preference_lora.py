@@ -134,6 +134,18 @@ def main() -> None:
                         help="Ego 动力学一致性损失权重（加速度+jerk Huber）；首次实验建议 0.1。")
     parser.add_argument("--lambda-q", type=float, default=0.0,
                         help="CSPQ 三因子对齐损失权重（q_hat vs axis_percentiles Huber）；首次实验建议 1.0。")
+    parser.add_argument("--lambda-lat", type=float, default=0.0,
+                        help="专家感知的横向基线保持约束权重；0 表示关闭。")
+    parser.add_argument("--lateral-tolerance", type=float, default=0.3,
+                        help="允许 LoRA 横向误差超过 baseline 的容差（米），默认 0.3。")
+    parser.add_argument("--lateral-topk-ratio", type=float, default=0.2,
+                        help="每条轨迹参与横向误差约束的最差时间点比例，默认 0.2。")
+    parser.add_argument("--lateral-smooth-weight", type=float, default=0.1,
+                        help="横向二阶差分平滑项权重，默认 0.1。")
+    parser.add_argument("--lambda-ict", type=float, default=0.0,
+                        help="偏好 latent 插值一致性损失权重；0 表示关闭并恢复原训练行为。")
+    parser.add_argument("--ict-alpha", type=float, default=1.0,
+                        help="ICT 中间强度使用的对称 Beta 分布参数，必须大于 0。")
     parser.add_argument("--rank", type=int, default=4, help="LoRA 秩。")
     parser.add_argument("--alpha", type=float, default=None)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -151,6 +163,18 @@ def main() -> None:
 
     if args.batch_size <= 0 or args.batch_size % 2 != 0:
         parser.error("--batch-size 必须为正偶数（每场景各半）")
+    if args.lambda_lat < 0:
+        parser.error("--lambda-lat 不能小于 0")
+    if args.lateral_tolerance <= 0:
+        parser.error("--lateral-tolerance 必须大于 0")
+    if not 0 < args.lateral_topk_ratio <= 1:
+        parser.error("--lateral-topk-ratio 必须位于 (0,1] 内")
+    if args.lateral_smooth_weight < 0:
+        parser.error("--lateral-smooth-weight 不能小于 0")
+    if args.lambda_ict < 0:
+        parser.error("--lambda-ict 不能小于 0")
+    if args.ict_alpha <= 0:
+        parser.error("--ict-alpha 必须大于 0")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA 不可用；可先用 --device cpu 做小规模冒烟。")
 
@@ -193,6 +217,10 @@ def main() -> None:
         direction=args.direction, learning_rate=args.lr,
         lambda_n=args.lambda_n, lambda_z=args.lambda_z, lambda_s=args.lambda_s,
         lambda_dyn=args.lambda_dyn, lambda_q=args.lambda_q,
+        lambda_lat=args.lambda_lat, lateral_tolerance=args.lateral_tolerance,
+        lateral_topk_ratio=args.lateral_topk_ratio,
+        lateral_smooth_weight=args.lateral_smooth_weight,
+        lambda_ict=args.lambda_ict, ict_alpha=args.ict_alpha,
     )
 
     # ---------- 可选验证集 ----------
@@ -248,14 +276,20 @@ def main() -> None:
                 print(f"  step {step}/{args.steps} "
                       f"loss={metrics['loss']:.4f} ego={metrics['ego_denoise']:.4f} "
                       f"mmd={metrics['mmd_z']:.4f} rank={metrics['rank_huber']:.4f} "
-                      f"dyn={metrics['dynamics']:.4f} q={metrics['factor_huber']:.4f}")
+                      f"dyn={metrics['dynamics']:.4f} q={metrics['factor_huber']:.4f} "
+                      f"lat={metrics['lateral']:.4f} ict={metrics['ict']:.4f} "
+                      f"ict_rho={metrics['ict_rho']:.4f}")
                 _swanlab_log(swanlab_run, {"train": {
                     "loss": metrics["loss"], "ego_denoise": metrics["ego_denoise"],
                     "neighbor": metrics["neighbor"], "mmd_z": metrics["mmd_z"],
                     "rank_huber": metrics["rank_huber"], "s_mean": metrics["s_mean"],
                     "s_std": metrics["s_std"], "dynamics": metrics["dynamics"],
                     "acceleration": metrics["acceleration"], "jerk": metrics["jerk"],
-                    "factor_huber": metrics["factor_huber"]}}, step=step)
+                    "factor_huber": metrics["factor_huber"], "lateral": metrics["lateral"],
+                    "lateral_offset": metrics["lateral_offset"],
+                    "lateral_smoothness": metrics["lateral_smoothness"],
+                    "lateral_max_abs": metrics["lateral_max_abs"],
+                    "ict": metrics["ict"], "ict_rho": metrics["ict_rho"]}}, step=step)
             if val_loader is not None and step % 100 == 0:
                 candidate = _validate_fixed()
                 last_val_step = step
@@ -263,13 +297,27 @@ def main() -> None:
                     best_loss = candidate["loss"]
                     best_state = {k: v.detach().cpu().clone() for k, v in planner.state_dict().items()
                                   if f".{style}.lora_" in k}
-                print(f"    [val] avg_loss={candidate['loss']:.4f}")
+                # 验证日志保留完整损失分项，便于判断泛化下降来自轨迹、偏好还是横向约束。
+                print(
+                    f"    [val] avg_loss={candidate['loss']:.4f} "
+                    f"ego={candidate['ego_denoise']:.4f} neighbor={candidate['neighbor']:.4f} "
+                    f"mmd={candidate['mmd_z']:.4f} rank={candidate['rank_huber']:.4f} "
+                    f"dyn={candidate['dynamics']:.4f} q={candidate['factor_huber']:.4f} "
+                    f"lat={candidate['lateral']:.4f} "
+                    f"lat_offset={candidate['lateral_offset']:.4f} "
+                    f"lat_smooth={candidate['lateral_smoothness']:.4f} "
+                    f"lat_max={candidate['lateral_max_abs']:.4f} "
+                    f"ict={candidate['ict']:.4f} ict_rho={candidate['ict_rho']:.4f}")
                 _swanlab_log(swanlab_run, {"val": {
                     "loss": candidate["loss"], "ego_denoise": candidate["ego_denoise"],
                     "neighbor": candidate["neighbor"], "mmd_z": candidate["mmd_z"],
                     "rank_huber": candidate["rank_huber"], "dynamics": candidate["dynamics"],
                     "acceleration": candidate["acceleration"], "jerk": candidate["jerk"],
-                    "factor_huber": candidate["factor_huber"]}}, step=step)
+                    "factor_huber": candidate["factor_huber"], "lateral": candidate["lateral"],
+                    "lateral_offset": candidate["lateral_offset"],
+                    "lateral_smoothness": candidate["lateral_smoothness"],
+                    "lateral_max_abs": candidate["lateral_max_abs"],
+                    "ict": candidate["ict"], "ict_rho": candidate["ict_rho"]}}, step=step)
             elif val_loader is None and metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
                 best_state = {k: v.detach().cpu().clone() for k, v in planner.state_dict().items()
@@ -283,13 +331,27 @@ def main() -> None:
             best_loss = candidate["loss"]
             best_state = {k: v.detach().cpu().clone() for k, v in planner.state_dict().items()
                           if f".{style}.lora_" in k}
-        print(f"    [val-final] avg_loss={candidate['loss']:.4f}")
+        # 最终验证使用与周期验证相同的完整字段，避免日志信息不一致。
+        print(
+            f"    [val-final] avg_loss={candidate['loss']:.4f} "
+            f"ego={candidate['ego_denoise']:.4f} neighbor={candidate['neighbor']:.4f} "
+            f"mmd={candidate['mmd_z']:.4f} rank={candidate['rank_huber']:.4f} "
+            f"dyn={candidate['dynamics']:.4f} q={candidate['factor_huber']:.4f} "
+            f"lat={candidate['lateral']:.4f} "
+            f"lat_offset={candidate['lateral_offset']:.4f} "
+            f"lat_smooth={candidate['lateral_smoothness']:.4f} "
+            f"lat_max={candidate['lateral_max_abs']:.4f} "
+            f"ict={candidate['ict']:.4f} ict_rho={candidate['ict_rho']:.4f}")
         _swanlab_log(swanlab_run, {"val_final": {
             "loss": candidate["loss"], "ego_denoise": candidate["ego_denoise"],
             "neighbor": candidate["neighbor"], "mmd_z": candidate["mmd_z"],
             "rank_huber": candidate["rank_huber"], "dynamics": candidate["dynamics"],
             "acceleration": candidate["acceleration"], "jerk": candidate["jerk"],
-            "factor_huber": candidate["factor_huber"]}}, step=args.steps)
+            "factor_huber": candidate["factor_huber"], "lateral": candidate["lateral"],
+            "lateral_offset": candidate["lateral_offset"],
+            "lateral_smoothness": candidate["lateral_smoothness"],
+            "lateral_max_abs": candidate["lateral_max_abs"],
+            "ict": candidate["ict"], "ict_rho": candidate["ict_rho"]}}, step=args.steps)
 
     # ---------- 保存 adapter checkpoint（内部 aggressive/conservative 槽位，对外 high/low）----------
     if best_state is not None:
@@ -311,4 +373,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

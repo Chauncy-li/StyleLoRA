@@ -41,13 +41,11 @@ from baseline.model.style_planner.diffusion_planner import Diffusion_Planner as 
 from baseline.model.wayformer.wayf_planner import WayFormer
 from baseline.simulation.anchor_generator import MapAnchorGenerator
 from baseline.simulation.candidate_selector import SafetyCandidateSelector
-from research_v1.execution.runtime import (
-    OnlinePreferenceConditioner,
+from baseline.simulation.runtime_trace import (
     append_runtime_trace_csv,
     append_runtime_trace_jsonl,
     build_runtime_trace_row,
 )
-from research_v1.stylization.runtime import ContinuousStyleRuntimeConditioner
 from baseline.simulation.render import NuplanScenarioRender
 from baseline.utils.config import Config
 
@@ -799,8 +797,15 @@ class StylePlanner(DiffusionPlanner):
         if not runtime_preference_enabled:
             self._online_preference_conditioner = None
         elif self._runtime_style_mode == "continuous_v6":
+            # Legacy research planners are intentionally optional.  Keeping this
+            # import local prevents the final StyleLoRA planner from depending on
+            # the archived research_v1 tree merely by importing DiffusionPlanner.
+            from research_v1.stylization.runtime import ContinuousStyleRuntimeConditioner
+
             self._online_preference_conditioner = ContinuousStyleRuntimeConditioner(config)
         elif self._runtime_style_mode == "legacy_preference_execution":
+            from research_v1.execution.runtime import OnlinePreferenceConditioner
+
             self._online_preference_conditioner = OnlinePreferenceConditioner(config)
         else:
             raise ValueError(

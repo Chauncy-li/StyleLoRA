@@ -16,3 +16,8 @@ results_test/
 result_l1/
 _disposable_diagnostics/
 tmp/
+.agents/
+.idea/
+RESEARCH.md
+requirements.before.txt
+run_nuboard.ipynb

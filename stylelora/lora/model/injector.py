@@ -9,6 +9,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 
+import torch
 from torch import nn
 
 from stylelora.lora.model.lora_layers import StyleEgoMaskedLoRALinear
@@ -138,7 +139,7 @@ def frozen_base_hash(model: nn.Module) -> str:
     return digest.hexdigest()
 
 
-def set_router(model: nn.Module, style: str, strength: float, enabled: bool = True) -> None:
+def set_router(model: nn.Module, style: str, strength: float | torch.Tensor, enabled: bool = True) -> None:
     """对模型中所有已注入的风格 LoRA 层批量设置路由状态。
 
     Args:
@@ -150,3 +151,26 @@ def set_router(model: nn.Module, style: str, strength: float, enabled: bool = Tr
     for _, module in iter_style_layers(model):
         module.set_router(style, strength, enabled)
 
+
+def set_conditional_router_coefficients(
+    model: nn.Module,
+    coefficients: torch.Tensor,
+    *,
+    enabled: bool = True,
+) -> None:
+    """把 ``[B,L,2]`` 条件系数按注入层顺序下发，最后一维为 Low/High。"""
+    layers = list(iter_style_layers(model))
+    if coefficients.ndim != 3 or coefficients.shape[1:] != (len(layers), 2):
+        raise ValueError(
+            f"条件系数必须为 [B,{len(layers)},2]，实际为 {tuple(coefficients.shape)}"
+        )
+    for index, (_, module) in enumerate(layers):
+        module.set_conditional_coefficients(
+            coefficients[:, index, 0], coefficients[:, index, 1], enabled=enabled
+        )
+
+
+def clear_conditional_router_coefficients(model: nn.Module) -> None:
+    """清除所有注入层的条件系数，完整恢复旧路由行为。"""
+    for _, module in iter_style_layers(model):
+        module.clear_conditional_coefficients()
