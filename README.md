@@ -6,13 +6,13 @@ StyleLoRA 是一个让自动驾驶规划器按用户偏好连续调整驾驶风�
 
 ## 第一次下载仓库：先配置自己的路径
 
-仓库不包含 NuPlan 数据、地图、缓存和模型权重。这些文件需要你自己准备。**不要把自己电脑或服务器的地址直接改进公共模板，也不要提交个人路径文件。**
+仓库不包含 NuPlan 数据、地图和训练缓存；当前使用的基础模型与最终 LoRA 权重放在仓库根目录的 `weights/`。个人机器上的数据地址仍只写在本机配置里，不要写进公共路径模板。
 
-先把仓库 clone 或下载到本机，并在仓库根目录操作。运行数据和模型脚本还需要能用的 NuPlan、PyTorch/CUDA 环境；服务器当前使用 `mdsn_py39`。`environment.yml` 可作为依赖参考，但它带有特定 Linux 环境信息，不要不检查就直接拿去 Windows 上创建环境。
+先把仓库 clone 或下载到 Ubuntu 本机，并在仓库根目录操作。运行数据和模型脚本还需要能用的 NuPlan、PyTorch/CUDA 环境；服务器当前使用 `mdsn_py39`。`environment.yml` 可作为依赖参考，创建环境时要按本机的 CUDA 和 NuPlan 安装情况检查。
 
 在仓库根目录，把示例配置复制成自己的配置。
 
-Linux / 服务器：
+Ubuntu 本地电脑和服务器都运行下面这组命令：
 
 ```bash
 if [ ! -f stylelora/config/paths.local.json ]; then
@@ -20,15 +20,7 @@ if [ ! -f stylelora/config/paths.local.json ]; then
 fi
 ```
 
-Windows PowerShell：
-
-```powershell
-if (!(Test-Path 'stylelora/config/paths.local.json')) {
-  Copy-Item 'stylelora/config/paths.example.json' 'stylelora/config/paths.local.json'
-}
-```
-
-然后打开 `stylelora/config/paths.local.json`，把地址改成**当前这台机器**上的实际位置。Windows 路径建议写成 `D:/nuplan/...` 这种形式。服务器模板里的路径不能直接拿去给 Windows 用。
+然后在 Ubuntu 上打开 `stylelora/config/paths.local.json`，把地址改成**当前这台机器**上的实际位置。你和协作者各自在自己的 Ubuntu 仓库里做一次；不要把你的本地数据路径写进服务器配置，反过来也一样。服务器模板里的默认地址通常不适用于本地电脑。
 
 常用配置项如下：
 
@@ -68,19 +60,30 @@ python stylelora/config/runtime_paths.py --show
 3. **整理训练样本**：从 cache 中筛选支持的场景，生成场景索引和 source manifest。
 4. **生成偏好监督**：从轨迹的速度、加减速、跟车等行为指标构造弱排序偏好；训练集拟合排序尺度，验证集沿用同一尺度。
 5. **提取场景特征并训练偏好编码器**：编码器把场景和轨迹信息转成训练适配器会用到的偏好表示；评估后导出 latent bank。
-6. **训练驾驶风格适配器**：冻结基础规划器，训练保守/激进方向的轻量适配器和路由器。
-7. **继续做 V5 微调并验证**：以 V4 适配器为起点做短时纵向响应微调，然后运行九档 `rho` 开环评测和轨迹图。
+6. **训练驾驶风格适配器**：保留基础规划器，训练保守/激进方向的轻量 LoRA 适配器和路由器。
+7. **微调最终模型并验证**：训练最终的纵向响应模型，然后运行九档 `rho` 开环评测和轨迹图。
 
-第 6 步不是从随机权重开始的一键流程：仓库中的 V4 启动脚本需要已有 V2 适配器；这些 checkpoint、NuPlan 数据、cache 和模型文件都不随仓库提供。因此，**如果你只想复现当前推荐的 V5，通常应先拿到准备好的 V4 checkpoint 和训练输入，再直接运行下面的 V5 脚本**。若要从原始数据开始，按完整指南逐步准备，并确认每步所需的前置模型都已存在。
+这些训练步骤需要准备好数据、cache 和训练用输入。若只想查看或分发当前模型权重，见下面的 `weights/`；若要重新训练，仍需准备训练数据和启动脚本要求的输入。
 
-## 运行当前推荐的 V5 微调和开环评测
+## 当前最终模型权重
 
-V5 脚本读取本机路径配置，并要求以下输入已经准备好：
+当前使用的权重整理在仓库根目录的 `weights/`：
+
+- `weights/baseline/baseline_diffplanner.pth`：基础 DiffPlanner 权重。
+- `weights/lora/conditional_high_longitudinal_response_v5.pt`：更激进方向的 LoRA 适配器。
+- `weights/lora/conditional_low_longitudinal_response_v5.pt`：更保守方向的 LoRA 适配器。
+- `weights/lora/conditional_router_longitudinal_response_v5.pt`：根据场景和强度控制两个方向的路由器。
+
+这三个 LoRA 文件要配合使用。`weights/` 不是 Git 忽略目录；如果把它加入提交，权重也会随仓库上传。注意 baseline checkpoint 约 97 MB，提交前确认仓库是否适合直接保存大文件。当前训练和评测脚本仍从路径配置指定的输入/输出目录加载模型，没有改成直接从 `weights/` 加载；代码保持不变。
+
+## 再次运行微调和开环评测
+
+一键脚本会重新微调最终模型，并运行开环验证。它读取本机路径配置，要求以下输入已经准备好：
 
 - `cache_root` 指向训练/验证 cache；
 - `source_root/INPUTS/` 中有 `args.json`、训练/验证 manifest、scene feature、latent bank 及索引文件；
-- `source_root/MODELS/` 中有 baseline checkpoint 和偏好编码器；
-- `output_root/MODELS/ORDERED_FEASIBLE_V4/` 中有 V4 的 high、low adapter 和 router checkpoint。
+- 输入目录中有 baseline checkpoint 和偏好编码器；
+- 训练启动脚本要求的初始化 LoRA 适配器和路由器已经放在它预期的位置。
 
 在服务器激活已有的 NuPlan/PyTorch 环境后，从仓库根目录运行：
 
@@ -94,7 +97,7 @@ bash stylelora/scripts/run_longitudinal_response_v5.sh
 CAST_GPU=0 bash stylelora/scripts/run_longitudinal_response_v5.sh
 ```
 
-这一步不会重新处理原始 NuPlan 数据，也不会重新训练偏好编码器或 V4 模型。
+这一步不会重新处理原始 NuPlan 数据，也不会重新训练偏好编码器或初始化权重。
 
 ## 闭环评测
 
@@ -110,7 +113,7 @@ CUDA_VISIBLE_DEVICES=2 bash stylelora/scripts/run_collision_drivable_v5_closed_l
 
 ## 哪些脚本使用了路径配置
 
-当前本机路径配置已接入 StyleLoRA 通用数据路径、V5 微调/开环脚本和两个 V5 闭环脚本。V2–V4 的历史实验启动脚本尚未统一接入；运行它们前请检查脚本中的路径默认值，或使用它们支持的环境变量覆盖。
+当前本机路径配置已接入 StyleLoRA 通用数据路径、V5 微调/开环脚本和两个 V5 闭环脚本。历史实验启动脚本尚未统一接入；运行它们前请检查脚本中的路径默认值，或使用它们支持的环境变量覆盖。
 
 ## 其他说明
 

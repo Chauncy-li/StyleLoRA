@@ -42,7 +42,7 @@ stylelora/
 
 ## 3. 运行前准备
 
-第一次下载仓库，先从示例复制一份本机配置。Linux 服务器：
+第一次下载仓库，先在当前 Ubuntu 机器上从示例复制一份本机配置：
 
 ```bash
 if [ ! -f stylelora/config/paths.local.json ]; then
@@ -51,16 +51,7 @@ fi
 python stylelora/config/runtime_paths.py --show
 ```
 
-Windows PowerShell：
-
-```powershell
-if (!(Test-Path 'stylelora/config/paths.local.json')) {
-  Copy-Item 'stylelora/config/paths.example.json' 'stylelora/config/paths.local.json'
-}
-py -3 stylelora/config/runtime_paths.py --show
-```
-
-打开 `stylelora/config/paths.local.json`，把仓库、NuPlan 数据、地图、cache、输入和输出目录改成当前机器的实际位置。Windows 路径可写成 `D:/nuplan/...`。这份文件不会提交到 Git；如果已经存在，不要再次从模板复制覆盖。
+打开 `stylelora/config/paths.local.json`，把仓库、NuPlan 数据、地图、cache、输入和输出目录改成当前机器的实际位置。本地 Ubuntu 和服务器分别维护各自的这份文件；文件不会提交到 Git。如果已经存在，不要再次从模板复制覆盖。
 
 常用路径键和修改说明见仓库根目录 [README](../README.md)。原来的 `NUPLAN_*` 环境变量仍可作为临时覆盖。下面命令里的 `/path/to/...` 是需要换成实际文件位置的占位符；某些 CLI 参数必须显式提供，配置文件不会替代这些必填参数。
 
@@ -312,7 +303,7 @@ jerk、前车间距和时距的闭环风格响应。`rho=0` 是基线保持参�
 
 ## 5. 当前 V5 主线（LONGITUDINAL_RESPONSE_V5）
 
-当前推荐的主模型从 Ordered Feasible V4 继续微调，增加 route-aligned longitudinal-response 约束，让相邻 `rho` 强度在有足够场景空间时产生可观测的纵向行为变化。训练和开环验证脚本为：
+当前推荐的最终模型加入 longitudinal-response 训练约束，让相邻 `rho` 强度在有足够场景空间时产生可观测的纵向行为变化。训练和开环验证脚本为：
 
 ```bash
 bash stylelora/scripts/run_longitudinal_response_v5.sh
@@ -325,7 +316,7 @@ CAST_EAAI_PAPER_RESULTS3/MODELS/LONGITUDINAL_RESPONSE_V5/
 CAST_EAAI_PAPER_RESULTS3/OPEN_LOOP/LONGITUDINAL_RESPONSE_V5/
 ```
 
-脚本需要已有的 V4 adapters/router、baseline checkpoint、偏好编码器、训练/验证 manifest、scene feature、latent bank 和 NuPlan cache；不是从原始数据开始的全自动流程。路径从本机 `stylelora/config/paths.local.json` 读取，也可用原有环境变量临时覆盖。失败后恢复步骤仍使用 `CAST_START_STEP`。
+脚本需要已有的初始化 LoRA 适配器和路由器、baseline checkpoint、偏好编码器、训练/验证 manifest、scene feature、latent bank 和 NuPlan cache；不是从原始数据开始的全自动流程。路径从本机 `stylelora/config/paths.local.json` 读取，也可用原有环境变量临时覆盖。失败后恢复步骤仍使用 `CAST_START_STEP`。
 
 V5 开环报告重点查看 `physical_response`、`continuous_rho`、`monotonicity` 和 `direction_check`。主行为指标是 route progress、速度、加减速度、jerk、gap/THW 及碰撞/道路区域代理；ADE/FDE 仅作诊断。
 
