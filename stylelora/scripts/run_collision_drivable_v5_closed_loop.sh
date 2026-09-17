@@ -20,6 +20,9 @@ PATHS_RESOLVER="$REPOSITORY/stylelora/config/runtime_paths.py"
 config_path() {
   python "$PATHS_RESOLVER" --get "$1"
 }
+optional_config_path() {
+  python "$PATHS_RESOLVER" --get-optional "$1"
+}
 
 RECORD_ROOT="${CAST_RECORD_ROOT:-$(config_path record_root)}"
 if [[ -n "${CAST_SOURCE_ROOT:-}" ]]; then
@@ -46,6 +49,18 @@ else
   TOKENS="$(config_path tokens_file)"
 fi
 V5_ROOT="$CAST_ROOT/MODELS/LONGITUDINAL_RESPONSE_V5"
+ARGS_FILE="$(optional_config_path args_file)"
+NORMALIZATION_FILE="$(optional_config_path normalization_file)"
+BASELINE_CKPT="$(optional_config_path baseline_checkpoint)"
+HIGH_ADAPTER="$(optional_config_path v5_high_adapter)"
+LOW_ADAPTER="$(optional_config_path v5_low_adapter)"
+ROUTER_CKPT="$(optional_config_path v5_router_checkpoint)"
+ARGS_FILE="${ARGS_FILE:-$SOURCE_ROOT/INPUTS/args.json}"
+NORMALIZATION_FILE="${NORMALIZATION_FILE:-$SOURCE_ROOT/INPUTS/normalization.json}"
+BASELINE_CKPT="${BASELINE_CKPT:-$SOURCE_ROOT/MODELS/baseline_diffplanner.pth}"
+HIGH_ADAPTER="${HIGH_ADAPTER:-$V5_ROOT/conditional_high_longitudinal_response_v5.pt}"
+LOW_ADAPTER="${LOW_ADAPTER:-$V5_ROOT/conditional_low_longitudinal_response_v5.pt}"
+ROUTER_CKPT="${ROUTER_CKPT:-$V5_ROOT/conditional_router_longitudinal_response_v5.pt}"
 OUTPUT="$CAST_ROOT/CLOSED_LOOP/LONGITUDINAL_RESPONSE_V5_COLLISION_DRIVABLE/SHARD_${SHARD_NAME^^}"
 LOG_ROOT="$CAST_ROOT/LOGS/LONGITUDINAL_RESPONSE_V5_COLLISION_DRIVABLE"
 LOG="$LOG_ROOT/${SHARD_NAME}.log"
@@ -53,12 +68,12 @@ LOG="$LOG_ROOT/${SHARD_NAME}.log"
 mkdir -p "$OUTPUT" "$LOG_ROOT"
 
 python -u -m stylelora.scripts.evaluate_closed_loop \
-  --args-file "$SOURCE_ROOT/INPUTS/args.json" \
-  --normalization-file "$SOURCE_ROOT/INPUTS/normalization.json" \
-  --baseline-checkpoint "$SOURCE_ROOT/MODELS/baseline_diffplanner.pth" \
-  --high-adapter "$V5_ROOT/conditional_high_longitudinal_response_v5.pt" \
-  --low-adapter "$V5_ROOT/conditional_low_longitudinal_response_v5.pt" \
-  --conditional-router-checkpoint "$V5_ROOT/conditional_router_longitudinal_response_v5.pt" \
+  --args-file "$ARGS_FILE" \
+  --normalization-file "$NORMALIZATION_FILE" \
+  --baseline-checkpoint "$BASELINE_CKPT" \
+  --high-adapter "$HIGH_ADAPTER" \
+  --low-adapter "$LOW_ADAPTER" \
+  --conditional-router-checkpoint "$ROUTER_CKPT" \
   --output-root "$OUTPUT" \
   --data-root "$DATA_ROOT" \
   --maps-root "$MAPS_ROOT" \

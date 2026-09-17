@@ -64,7 +64,7 @@ Maps:      /mnt/mydata/lishangwen/TrafficDataSetSource/dataset/maps
 Tokens:    /mnt/mydata/lishangwen/Nuplan-Baseline-Record/CAST_EAAI_PAPER_RESULTS3/INPUTS/closed_loop_tokens_balanced_50.json
 ```
 
-它读取 `SOURCE_ROOT/INPUTS/args.json`、`SOURCE_ROOT/INPUTS/normalization.json`、`SOURCE_ROOT/MODELS/baseline_diffplanner.pth`，以及 `OUTPUT_ROOT/MODELS/LONGITUDINAL_RESPONSE_V5/` 下的 V5 adapters/router。闭环输出默认位于：
+默认读取 `SOURCE_ROOT/INPUTS/args.json`、`SOURCE_ROOT/INPUTS/normalization.json`、`SOURCE_ROOT/MODELS/baseline_diffplanner.pth`，以及 `OUTPUT_ROOT/MODELS/LONGITUDINAL_RESPONSE_V5/` 下的 V5 adapters/router。若要使用仓库 `weights/` 目录中的文件，可在 `paths.local.json` 设置 `args_file`、`normalization_file` 及对应模型路径；设为 `null` 或不填写时保持上述默认位置。闭环输出默认位于：
 
 ```text
 OUTPUT_ROOT/CLOSED_LOOP/LONGITUDINAL_RESPONSE_V5_COLLISION_DRIVABLE/SHARD_<NEGATIVE|CENTER|POSITIVE>/

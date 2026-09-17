@@ -89,11 +89,24 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--get", metavar="KEY", help="print one configured value")
+    group.add_argument(
+        "--get-optional",
+        metavar="KEY",
+        help="print a configured value, or an empty string if the key is missing or null",
+    )
     group.add_argument("--show", action="store_true", help="print all resolved paths")
     args = parser.parse_args()
 
     if args.get:
         print(get_config_value(args.get))
+        return
+    if args.get_optional:
+        paths = _load_paths()
+        if args.get_optional not in paths:
+            return
+        value = get_config_value(args.get_optional)
+        if value is not None:
+            print(value)
         return
     resolved = {key: get_config_value(key) for key in _load_paths()}
     print(json.dumps(resolved, ensure_ascii=False, indent=2))

@@ -316,7 +316,7 @@ CAST_EAAI_PAPER_RESULTS3/MODELS/LONGITUDINAL_RESPONSE_V5/
 CAST_EAAI_PAPER_RESULTS3/OPEN_LOOP/LONGITUDINAL_RESPONSE_V5/
 ```
 
-脚本需要已有的初始化 LoRA 适配器和路由器、baseline checkpoint、偏好编码器、训练/验证 manifest、scene feature、latent bank 和 NuPlan cache；不是从原始数据开始的全自动流程。路径从本机 `stylelora/config/paths.local.json` 读取，也可用原有环境变量临时覆盖。失败后恢复步骤仍使用 `CAST_START_STEP`。
+脚本需要已有的 `args.json` 和归一化文件、初始化 LoRA 适配器和路由器、baseline checkpoint、偏好编码器、训练/验证 manifest、scene feature、latent bank 和 NuPlan cache；不是从原始数据开始的全自动流程。路径从本机 `stylelora/config/paths.local.json` 读取，也可用原有环境变量临时覆盖。失败后恢复步骤仍使用 `CAST_START_STEP`。
 
 V5 开环报告重点查看 `physical_response`、`continuous_rho`、`monotonicity` 和 `direction_check`。主行为指标是 route progress、速度、加减速度、jerk、gap/THW 及碰撞/道路区域代理；ADE/FDE 仅作诊断。
 
@@ -331,6 +331,8 @@ bash stylelora/scripts/run_collision_drivable_v5_closed_loop.sh positive "0.5,0.
 ```
 
 数据、地图、tokens 和 V5 模型路径从本机路径配置读取。脚本默认将分 shard 的输出保存在 `output_root/CLOSED_LOOP/LONGITUDINAL_RESPONSE_V5_COLLISION_DRIVABLE/`，日志保存在对应 `LOGS/` 目录。轨迹修复是可选的闭环推理处理，不属于训练得到的 StyleLoRA 适配器。
+
+两个 V5 闭环启动脚本还会读取 `baseline_checkpoint`、三个 V5 LoRA 路径、`args_file` 和 `normalization_file`。这些配置项默认是 `null`，此时沿用原有 `source_root` / `output_root` 目录；若要直接使用仓库根目录的 `weights/`，按主 README 的示例填写完整路径即可。数据、地图和 tokens 仍需单独准备。
 
 ## 7. 运行时反馈接口
 

@@ -11,6 +11,13 @@ map, cache, and output locations. Values may refer to other keys using
 `${key}`, so changing `record_root` also updates the default source, output,
 and cache paths.
 
+The optional `baseline_checkpoint`, `v5_high_adapter`, `v5_low_adapter`,
+`v5_router_checkpoint`, `args_file`, and `normalization_file` entries can be
+left as `null`. The V5 closed-loop launchers then keep using the existing paths
+under `source_root` and `output_root`. Set any entry to an absolute path only
+when that file is stored elsewhere; the specified path overrides the
+corresponding default.
+
 Python code can read a path with:
 
 ```python

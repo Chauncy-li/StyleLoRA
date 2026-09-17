@@ -12,6 +12,12 @@
     "cache_train_val_manifest_path": "${record_root}/CACHE/boston_cache_train_val_manifest.json",
     "data_root": "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/nuplan-v1.1/splits/train_boston",
     "maps_root": "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/maps",
+    "baseline_checkpoint": null,
+    "v5_high_adapter": null,
+    "v5_low_adapter": null,
+    "v5_router_checkpoint": null,
+    "args_file": null,
+    "normalization_file": null,
     "log_names_path": "${style_record_root}/nuplan_scenarios_boston.json",
     "tokens_file": "${output_root}/INPUTS/closed_loop_tokens_balanced_50.json",
     "gpu": "2"

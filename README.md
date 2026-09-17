@@ -2,11 +2,11 @@
 
 StyleLoRA 是一个让自动驾驶规划器按用户偏好连续调整驾驶风格的方法。运行时用 `rho` 表示调整强度：`rho < 0` 更保守，`rho > 0` 更激进，`rho = 0` 保持原始规划器。
 
-本文先说明新机器怎么配置路径，再说明数据如何一步步变成可训练模型，以及当前推荐的 V5 微调和评测流程。完整的数据处理命令在 [stylelora/README.md](stylelora/README.md)。
+本文先说明新机器怎么配置路径，再说明数据如何一步步变成可训练模型，以及当前推荐的模型微调和评测流程。完整的数据处理命令在 [stylelora/README.md](stylelora/README.md)。
 
 ## 第一次下载仓库：先配置自己的路径
 
-仓库不包含 NuPlan 数据、地图和训练缓存；当前使用的基础模型与最终 LoRA 权重放在仓库根目录的 `weights/`。个人机器上的数据地址仍只写在本机配置里，不要写进公共路径模板。
+仓库不包含 NuPlan 数据、地图和训练缓存；当前使用的 baseline、V5 LoRA 权重，以及配套的 `args.json` 和 `normalization.json` 已放在根目录 `weights/`。**不要把自己电脑或服务器的数据地址写进公共路径模板，也不要提交个人路径文件。**
 
 先把仓库 clone 或下载到 Ubuntu 本机，并在仓库根目录操作。运行数据和模型脚本还需要能用的 NuPlan、PyTorch/CUDA 环境；服务器当前使用 `mdsn_py39`。`environment.yml` 可作为依赖参考，创建环境时要按本机的 CUDA 和 NuPlan 安装情况检查。
 
@@ -36,6 +36,22 @@ fi
 | `style_record_root` | 通用数据流水线使用的另一处记录目录 | 这部分数据放在别处时 |
 | `tokens_file` | 闭环评测使用的固定场景列表 | 使用另一份场景列表时 |
 | `gpu` | V5 训练/开环默认使用的 GPU 编号 | 默认 GPU 不是要用的那张卡时 |
+| `baseline_checkpoint` | 闭环评测使用的 baseline 权重文件 | 权重不在 `source_root/MODELS/` 时才填写 |
+| `v5_high_adapter`、`v5_low_adapter`、`v5_router_checkpoint` | V5 闭环评测使用的三个权重文件 | 权重不在 `output_root/MODELS/LONGITUDINAL_RESPONSE_V5/` 时才填写 |
+| `args_file`、`normalization_file` | 闭环评测使用的 planner 参数和归一化文件 | 文件不在 `source_root/INPUTS/` 时才填写 |
+
+上面六个路径默认是 `null`，**不用改时保持 `null` 即可**：两个 V5 闭环脚本会继续按原来的 `source_root` 和 `output_root` 目录查找文件。如果改用仓库里的 `weights/`，就把对应项填成实际完整路径；只覆盖填写了路径的文件，其余仍按原位置读取。旧版 `paths.local.json` 即使没有这些字段，也会回退到原路径。示例：
+
+```json
+{
+"baseline_checkpoint": "${repo_root}/weights/baseline/baseline_diffplanner.pth",
+"v5_high_adapter": "${repo_root}/weights/lora/conditional_high_longitudinal_response_v5.pt",
+"v5_low_adapter": "${repo_root}/weights/lora/conditional_low_longitudinal_response_v5.pt",
+"v5_router_checkpoint": "${repo_root}/weights/lora/conditional_router_longitudinal_response_v5.pt",
+"args_file": "${repo_root}/weights/inputs/args.json",
+"normalization_file": "${repo_root}/weights/inputs/normalization.json"
+}
+```
 
 模板里的 `source_root`、`output_root`、`cache_root` 等路径会根据 `record_root` 自动拼出来。只要这些目录仍在同一个总目录下，通常改 `record_root` 就够了；数据集、地图和仓库位置则按实际情况分别填写。
 
@@ -63,25 +79,26 @@ python stylelora/config/runtime_paths.py --show
 6. **训练驾驶风格适配器**：保留基础规划器，训练保守/激进方向的轻量 LoRA 适配器和路由器。
 7. **微调最终模型并验证**：训练最终的纵向响应模型，然后运行九档 `rho` 开环评测和轨迹图。
 
-这些训练步骤需要准备好数据、cache 和训练用输入。若只想查看或分发当前模型权重，见下面的 `weights/`；若要重新训练，仍需准备训练数据和启动脚本要求的输入。
+这些训练步骤需要已经准备好的数据、cache、偏好编码器和 V4 初始化适配器；初始化模型与中间训练产物不都包含在仓库里。若只想验证当前最终模型，可使用下方 `weights/` 中的 baseline 和 V5 权重；若要重新训练，则按完整指南准备每一步需要的输入。
 
 ## 当前最终模型权重
 
-当前使用的权重整理在仓库根目录的 `weights/`：
+当前模型和闭环所需配套参数整理在仓库根目录 `weights/`：
 
-- `weights/baseline/baseline_diffplanner.pth`：基础 DiffPlanner 权重。
-- `weights/lora/conditional_high_longitudinal_response_v5.pt`：更激进方向的 LoRA 适配器。
-- `weights/lora/conditional_low_longitudinal_response_v5.pt`：更保守方向的 LoRA 适配器。
-- `weights/lora/conditional_router_longitudinal_response_v5.pt`：根据场景和强度控制两个方向的路由器。
+- `baseline/baseline_diffplanner.pth`：基础 DiffPlanner 权重。
+- `lora/conditional_high_longitudinal_response_v5.pt`：更激进方向的 LoRA 适配器。
+- `lora/conditional_low_longitudinal_response_v5.pt`：更保守方向的 LoRA 适配器。
+- `lora/conditional_router_longitudinal_response_v5.pt`：根据场景和强度控制两个方向的路由器。
+- `inputs/args.json`、`inputs/normalization.json`：闭环评测使用的规划器参数和归一化统计。
 
-这三个 LoRA 文件要配合使用。`weights/` 不是 Git 忽略目录；如果把它加入提交，权重也会随仓库上传。注意 baseline checkpoint 约 97 MB，提交前确认仓库是否适合直接保存大文件。当前训练和评测脚本仍从路径配置指定的输入/输出目录加载模型，没有改成直接从 `weights/` 加载；代码保持不变。
+三个 LoRA 文件要配合使用。要从 `weights/` 运行闭环评测，在 `paths.local.json` 中按上面的示例填写六个文件路径；注意在本地运行的时候要注意设置成本地的路径保存地址；默认的 `null` 定位到了远程服务器的地址 `source_root/INPUTS/`、`source_root/MODELS/` 和 `output_root/MODELS/LONGITUDINAL_RESPONSE_V5/` 位置。NuPlan 数据、地图和闭环 tokens 仍需另行准备。
 
 ## 再次运行微调和开环评测
 
 一键脚本会重新微调最终模型，并运行开环验证。它读取本机路径配置，要求以下输入已经准备好：
 
 - `cache_root` 指向训练/验证 cache；
-- `source_root/INPUTS/` 中有 `args.json`、训练/验证 manifest、scene feature、latent bank 及索引文件；
+- `source_root/INPUTS/` 中有 `args.json`、`normalization.json`、训练/验证 manifest、scene feature、latent bank 及索引文件；
 - 输入目录中有 baseline checkpoint 和偏好编码器；
 - 训练启动脚本要求的初始化 LoRA 适配器和路由器已经放在它预期的位置。
 
@@ -101,7 +118,7 @@ CAST_GPU=0 bash stylelora/scripts/run_longitudinal_response_v5.sh
 
 ## 闭环评测
 
-闭环需要 NuPlan 数据和地图、V5 checkpoint，以及 `tokens_file` 指向的共同场景列表。把九个 `rho` 分成三个 shard，可分别在三个终端运行：
+闭环需要 NuPlan 数据和地图、V5 checkpoint、planner 参数与归一化文件，以及 `tokens_file` 指向的共同场景列表。以上六个模型/参数文件既可用 `paths.local.json` 指向 `weights/`，也可保持 `null` 从原有服务器目录读取。把九个 `rho` 分成三个 shard，可分别在三个终端运行：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash stylelora/scripts/run_collision_drivable_v5_closed_loop.sh negative "-1,-0.75,-0.5"
@@ -119,5 +136,5 @@ CUDA_VISIBLE_DEVICES=2 bash stylelora/scripts/run_collision_drivable_v5_closed_l
 
 - `rho=0` 用来检查是否保留原始规划器；开环主分析关注路线进度、速度、加减速、jerk、跟车距离/时距和风格响应，ADE/FDE 是轨迹诊断项。
 - 运行时反馈接口 `apply_user_feedback(...)` 可以按“更保守/更激进”增减当前 `rho`，但它不是从用户历史中学习反馈的模型。
-- 数据、cache、checkpoint、实验输出和个人路径配置都不应提交到 Git；`results/` 和 `paths.local.json` 已在 `.gitignore` 中排除。
+- 数据、cache、实验输出和个人路径配置不应提交到 Git；当前 `weights/` 是有意纳入仓库的模型与推理参数，`results/` 和 `paths.local.json` 则在 `.gitignore` 中排除。
 - 快速检查代码：`python -m compileall -q baseline stylelora`；运行测试：`python -m pytest stylelora/tests -q`。
