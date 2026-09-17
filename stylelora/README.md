@@ -1,4 +1,4 @@
-# StyleLoRA 新人运行指南
+# StyleLoRA
 
 ## 1. 研究故事
 
@@ -42,13 +42,35 @@ stylelora/
 
 ## 3. 运行前准备
 
+第一次下载仓库，先从示例复制一份本机配置。Linux 服务器：
+
+```bash
+if [ ! -f stylelora/config/paths.local.json ]; then
+  cp stylelora/config/paths.example.json stylelora/config/paths.local.json
+fi
+python stylelora/config/runtime_paths.py --show
+```
+
+Windows PowerShell：
+
+```powershell
+if (!(Test-Path 'stylelora/config/paths.local.json')) {
+  Copy-Item 'stylelora/config/paths.example.json' 'stylelora/config/paths.local.json'
+}
+py -3 stylelora/config/runtime_paths.py --show
+```
+
+打开 `stylelora/config/paths.local.json`，把仓库、NuPlan 数据、地图、cache、输入和输出目录改成当前机器的实际位置。Windows 路径可写成 `D:/nuplan/...`。这份文件不会提交到 Git；如果已经存在，不要再次从模板复制覆盖。
+
+常用路径键和修改说明见仓库根目录 [README](../README.md)。原来的 `NUPLAN_*` 环境变量仍可作为临时覆盖。下面命令里的 `/path/to/...` 是需要换成实际文件位置的占位符；某些 CLI 参数必须显式提供，配置文件不会替代这些必填参数。
+
 所有命令都应在仓库根目录运行：
 
 ```bash
 python -m stylelora.scripts.<脚本名> --help
 ```
 
-推荐优先设置以下环境变量，避免在脚本中硬编码服务器路径：
+通常不用每次手动设置路径环境变量，程序会先读 `paths.local.json`。如果只想在当前终端临时换一个位置，可以用环境变量覆盖，例如：
 
 ```bash
 export NUPLAN_DATA_PATH=/path/to/nuplan/db
@@ -303,7 +325,7 @@ CAST_EAAI_PAPER_RESULTS3/MODELS/LONGITUDINAL_RESPONSE_V5/
 CAST_EAAI_PAPER_RESULTS3/OPEN_LOOP/LONGITUDINAL_RESPONSE_V5/
 ```
 
-脚本需要已有的 V4 adapters/router、baseline checkpoint、偏好编码器、训练/验证 manifest、scene feature、latent bank 和 NuPlan cache；不是从原始数据开始的全自动流程。路径和恢复步骤见脚本顶部及运行参数。
+脚本需要已有的 V4 adapters/router、baseline checkpoint、偏好编码器、训练/验证 manifest、scene feature、latent bank 和 NuPlan cache；不是从原始数据开始的全自动流程。路径从本机 `stylelora/config/paths.local.json` 读取，也可用原有环境变量临时覆盖。失败后恢复步骤仍使用 `CAST_START_STEP`。
 
 V5 开环报告重点查看 `physical_response`、`continuous_rho`、`monotonicity` 和 `direction_check`。主行为指标是 route progress、速度、加减速度、jerk、gap/THW 及碰撞/道路区域代理；ADE/FDE 仅作诊断。
 
@@ -317,7 +339,7 @@ bash stylelora/scripts/run_collision_drivable_v5_closed_loop.sh center "-0.25,0,
 bash stylelora/scripts/run_collision_drivable_v5_closed_loop.sh positive "0.5,0.75,1"
 ```
 
-数据、地图、tokens 和 V5 模型路径需与服务器环境匹配。脚本默认将分 shard 的输出保存在 `CAST_EAAI_PAPER_RESULTS3/CLOSED_LOOP/LONGITUDINAL_RESPONSE_V5_COLLISION_DRIVABLE/`，日志保存在对应 `LOGS/` 目录。轨迹修复是可选的闭环推理处理，不属于训练得到的 StyleLoRA 适配器。
+数据、地图、tokens 和 V5 模型路径从本机路径配置读取。脚本默认将分 shard 的输出保存在 `output_root/CLOSED_LOOP/LONGITUDINAL_RESPONSE_V5_COLLISION_DRIVABLE/`，日志保存在对应 `LOGS/` 目录。轨迹修复是可选的闭环推理处理，不属于训练得到的 StyleLoRA 适配器。
 
 ## 7. 运行时反馈接口
 

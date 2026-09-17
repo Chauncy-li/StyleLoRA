@@ -16,12 +16,35 @@ esac
 REPOSITORY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPOSITORY"
 
-RECORD_ROOT="${CAST_RECORD_ROOT:-/mnt/mydata/lishangwen/Nuplan-Baseline-Record}"
-SOURCE_ROOT="${CAST_SOURCE_ROOT:-$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS}"
-CAST_ROOT="${CAST_OUTPUT_ROOT:-$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS3}"
-DATA_ROOT="${NUPLAN_DATA_ROOT:-/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/nuplan-v1.1/splits/train_boston}"
-MAPS_ROOT="${NUPLAN_MAPS_ROOT:-/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/maps}"
-TOKENS="${CAST_TOKENS_FILE:-$CAST_ROOT/INPUTS/closed_loop_tokens_balanced_50.json}"
+PATHS_RESOLVER="$REPOSITORY/stylelora/config/runtime_paths.py"
+config_path() {
+  python "$PATHS_RESOLVER" --get "$1"
+}
+
+RECORD_ROOT="${CAST_RECORD_ROOT:-$(config_path record_root)}"
+if [[ -n "${CAST_SOURCE_ROOT:-}" ]]; then
+  SOURCE_ROOT="$CAST_SOURCE_ROOT"
+elif [[ -n "${CAST_RECORD_ROOT:-}" ]]; then
+  SOURCE_ROOT="$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS"
+else
+  SOURCE_ROOT="$(config_path source_root)"
+fi
+if [[ -n "${CAST_OUTPUT_ROOT:-}" ]]; then
+  CAST_ROOT="$CAST_OUTPUT_ROOT"
+elif [[ -n "${CAST_RECORD_ROOT:-}" ]]; then
+  CAST_ROOT="$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS3"
+else
+  CAST_ROOT="$(config_path output_root)"
+fi
+DATA_ROOT="${NUPLAN_DATA_ROOT:-$(config_path data_root)}"
+MAPS_ROOT="${NUPLAN_MAPS_ROOT:-$(config_path maps_root)}"
+if [[ -n "${CAST_TOKENS_FILE:-}" ]]; then
+  TOKENS="$CAST_TOKENS_FILE"
+elif [[ -n "${CAST_RECORD_ROOT:-}" || -n "${CAST_OUTPUT_ROOT:-}" ]]; then
+  TOKENS="$CAST_ROOT/INPUTS/closed_loop_tokens_balanced_50.json"
+else
+  TOKENS="$(config_path tokens_file)"
+fi
 V5_ROOT="$CAST_ROOT/MODELS/LONGITUDINAL_RESPONSE_V5"
 OUTPUT="$CAST_ROOT/CLOSED_LOOP/LONGITUDINAL_RESPONSE_V5_COLLISION_PARALLEL/SHARD_${SHARD_NAME^^}"
 LOG_ROOT="$CAST_ROOT/LOGS/LONGITUDINAL_RESPONSE_V5_COLLISION_PARALLEL"

@@ -2,16 +2,40 @@
 # Optional V5 short fine-tuning from V4 with a physical longitudinal-response margin.
 set -Eeuo pipefail
 
-REPO_ROOT="${CAST_REPO_ROOT:-/home/lisw/programs/Nuplan-Diffusion-Baseline}"
-RECORD_ROOT="${CAST_RECORD_ROOT:-/mnt/mydata/lishangwen/Nuplan-Baseline-Record}"
-SOURCE_ROOT="${CAST_SOURCE_ROOT:-$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS}"
-CAST_ROOT="${CAST_OUTPUT_ROOT:-$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS3}"
-CAST_GPU="${CAST_GPU:-2}"
+SCRIPT_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PATHS_RESOLVER="$SCRIPT_REPO_ROOT/stylelora/config/runtime_paths.py"
+config_path() {
+  python "$PATHS_RESOLVER" --get "$1"
+}
+
+REPO_ROOT="${CAST_REPO_ROOT:-$(config_path repo_root)}"
+RECORD_ROOT="${CAST_RECORD_ROOT:-$(config_path record_root)}"
+if [[ -n "${CAST_SOURCE_ROOT:-}" ]]; then
+  SOURCE_ROOT="$CAST_SOURCE_ROOT"
+elif [[ -n "${CAST_RECORD_ROOT:-}" ]]; then
+  SOURCE_ROOT="$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS"
+else
+  SOURCE_ROOT="$(config_path source_root)"
+fi
+if [[ -n "${CAST_OUTPUT_ROOT:-}" ]]; then
+  CAST_ROOT="$CAST_OUTPUT_ROOT"
+elif [[ -n "${CAST_RECORD_ROOT:-}" ]]; then
+  CAST_ROOT="$RECORD_ROOT/CAST_EAAI_PAPER_RESULTS3"
+else
+  CAST_ROOT="$(config_path output_root)"
+fi
+CAST_GPU="${CAST_GPU:-$(config_path gpu)}"
 CAST_START_STEP="${CAST_START_STEP:-1}"
 
 INPUT_ROOT="$SOURCE_ROOT/INPUTS"
 SOURCE_MODELS="$SOURCE_ROOT/MODELS"
-CACHE_ROOT="$RECORD_ROOT/CACHE/boston_cache_train_val"
+if [[ -n "${CAST_CACHE_ROOT:-}" ]]; then
+  CACHE_ROOT="$CAST_CACHE_ROOT"
+elif [[ -n "${CAST_RECORD_ROOT:-}" ]]; then
+  CACHE_ROOT="$RECORD_ROOT/CACHE/boston_cache_train_val"
+else
+  CACHE_ROOT="$(config_path cache_root)"
+fi
 
 ARGS_FILE="$INPUT_ROOT/args.json"
 BASELINE_CKPT="$SOURCE_MODELS/baseline_diffplanner.pth"

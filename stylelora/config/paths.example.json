@@ -1,0 +1,19 @@
+{
+  "paths": {
+    "program_root": "/home/lisw/programs",
+    "repo_root": "/home/lisw/programs/Nuplan-Diffusion-Baseline",
+    "devkit_root": "${repo_root}/nuplan-devkit",
+    "style_record_root": "/mnt/mydata/lishangwen/NuplanBaselinesRecord",
+    "record_root": "/mnt/mydata/lishangwen/Nuplan-Baseline-Record",
+    "source_root": "${record_root}/CAST_EAAI_PAPER_RESULTS",
+    "output_root": "${record_root}/CAST_EAAI_PAPER_RESULTS3",
+    "cache_root": "${record_root}/CACHE/boston_cache_train_val",
+    "cache_train_val_list_path": "${record_root}/CACHE/boston_cache_train_val_list.json",
+    "cache_train_val_manifest_path": "${record_root}/CACHE/boston_cache_train_val_manifest.json",
+    "data_root": "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/nuplan-v1.1/splits/train_boston",
+    "maps_root": "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/maps",
+    "log_names_path": "${style_record_root}/nuplan_scenarios_boston.json",
+    "tokens_file": "${output_root}/INPUTS/closed_loop_tokens_balanced_50.json",
+    "gpu": "2"
+  }
+}

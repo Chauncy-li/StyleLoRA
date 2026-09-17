@@ -6,50 +6,74 @@ import os
 import sys
 from pathlib import Path
 
+from stylelora.config.runtime_paths import get_config_value
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESEARCH_ROOT = REPO_ROOT / "stylelora"
 DEVKIT_ROOT = REPO_ROOT / "nuplan-devkit"
-SERVER_PROGRAM_ROOT = Path(os.environ.get("NUPLAN_SERVER_PROGRAM_ROOT", "/home/lisw/programs"))
+SERVER_PROGRAM_ROOT = Path(
+    os.environ.get("NUPLAN_SERVER_PROGRAM_ROOT", str(get_config_value("program_root", "/home/lisw/programs")))
+)
+_SERVER_REPO_DEFAULT = (
+    SERVER_PROGRAM_ROOT / "Nuplan-Diffusion-Baseline"
+    if os.environ.get("NUPLAN_SERVER_PROGRAM_ROOT", "").strip()
+    else get_config_value("repo_root", SERVER_PROGRAM_ROOT / "Nuplan-Diffusion-Baseline")
+)
 SERVER_REPO_ROOT = Path(
     os.environ.get(
         "NUPLAN_SERVER_REPO_ROOT",
-        str(SERVER_PROGRAM_ROOT / "Nuplan-Diffusion-Baseline"),
+        str(_SERVER_REPO_DEFAULT),
     )
+)
+_SERVER_DEVKIT_DEFAULT = (
+    SERVER_REPO_ROOT / "nuplan-devkit"
+    if any(
+        os.environ.get(name, "").strip()
+        for name in ("NUPLAN_SERVER_PROGRAM_ROOT", "NUPLAN_SERVER_REPO_ROOT")
+    )
+    else get_config_value("devkit_root", SERVER_REPO_ROOT / "nuplan-devkit")
 )
 SERVER_DEVKIT_ROOT = Path(
     os.environ.get(
         "NUPLAN_SERVER_DEVKIT_ROOT",
-        str(SERVER_REPO_ROOT / "nuplan-devkit"),
+        str(_SERVER_DEVKIT_DEFAULT),
     )
 )
 SERVER_STYLE_RECORD_ROOT = Path(
     os.environ.get(
         "NUPLAN_SERVER_STYLE_RECORD_ROOT",
-        "/mnt/mydata/lishangwen/NuplanBaselinesRecord",
+        str(get_config_value("style_record_root", "/mnt/mydata/lishangwen/NuplanBaselinesRecord")),
     )
 )
 SERVER_CACHE_RECORD_ROOT = Path(
     os.environ.get(
         "NUPLAN_SERVER_CACHE_RECORD_ROOT",
-        "/mnt/mydata/lishangwen/Nuplan-Baseline-Record",
+        str(get_config_value("record_root", "/mnt/mydata/lishangwen/Nuplan-Baseline-Record")),
     )
 )
 SERVER_DATA_ROOT = Path(
     os.environ.get(
         "NUPLAN_SERVER_DATA_ROOT",
-        "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/nuplan-v1.1/splits/train_boston",
+        str(get_config_value("data_root", "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/nuplan-v1.1/splits/train_boston")),
     )
 )
 SERVER_MAP_ROOT = Path(
     os.environ.get(
         "NUPLAN_SERVER_MAP_ROOT",
-        "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/maps",
+        str(get_config_value("maps_root", "/mnt/mydata/lishangwen/TrafficDataSetSource/dataset/maps")),
     )
 )
 SERVER_LOG_NAMES_PATH = Path(
     os.environ.get(
         "NUPLAN_SERVER_LOG_NAMES_PATH",
-        str(SERVER_STYLE_RECORD_ROOT / "nuplan_scenarios_boston.json"),
+        str(
+            SERVER_STYLE_RECORD_ROOT / "nuplan_scenarios_boston.json"
+            if os.environ.get("NUPLAN_SERVER_STYLE_RECORD_ROOT", "").strip()
+            else get_config_value(
+                "log_names_path",
+                SERVER_STYLE_RECORD_ROOT / "nuplan_scenarios_boston.json",
+            )
+        ),
     )
 )
 
@@ -105,17 +129,46 @@ DEFAULT_SCENARIO_FILTER_ROOT = _env_path(
 DEFAULT_NUPLAN_DATA_PATH = os.environ.get("NUPLAN_DATA_PATH", str(SERVER_DATA_ROOT)).strip()
 DEFAULT_NUPLAN_MAP_PATH = os.environ.get("NUPLAN_MAP_PATH", str(SERVER_MAP_ROOT)).strip()
 DEFAULT_NUPLAN_LOG_NAMES_PATH = os.environ.get("NUPLAN_LOG_NAMES_PATH", str(SERVER_LOG_NAMES_PATH)).strip()
+_CACHE_ROOT_ENV_OVERRIDES = any(
+    os.environ.get(name, "").strip()
+    for name in (
+        "NUPLAN_SERVER_CACHE_RECORD_ROOT",
+        "NUPLAN_RECORD_ROOT",
+        "NUPLAN_CACHE_ROOT",
+    )
+)
+_DEFAULT_CACHE_TRAIN_VAL_DIR = (
+    DEFAULT_CACHE_ROOT / "boston_cache_train_val"
+    if _CACHE_ROOT_ENV_OVERRIDES
+    else get_config_value("cache_root", DEFAULT_CACHE_ROOT / "boston_cache_train_val")
+)
+_DEFAULT_CACHE_TRAIN_VAL_LIST_PATH = (
+    DEFAULT_CACHE_ROOT / "boston_cache_train_val_list.json"
+    if _CACHE_ROOT_ENV_OVERRIDES
+    else get_config_value(
+        "cache_train_val_list_path",
+        DEFAULT_CACHE_ROOT / "boston_cache_train_val_list.json",
+    )
+)
+_DEFAULT_CACHE_TRAIN_VAL_MANIFEST_PATH = (
+    DEFAULT_CACHE_ROOT / "boston_cache_train_val_manifest.json"
+    if _CACHE_ROOT_ENV_OVERRIDES
+    else get_config_value(
+        "cache_train_val_manifest_path",
+        DEFAULT_CACHE_ROOT / "boston_cache_train_val_manifest.json",
+    )
+)
 DEFAULT_CACHE_TRAIN_VAL_DIR = _env_path(
     "NUPLAN_CACHE_TRAIN_VAL_DIR",
-    DEFAULT_CACHE_ROOT / "boston_cache_train_val",
+    _DEFAULT_CACHE_TRAIN_VAL_DIR,
 )
 DEFAULT_CACHE_TRAIN_VAL_LIST_PATH = _env_path(
     "NUPLAN_CACHE_TRAIN_VAL_LIST_PATH",
-    DEFAULT_CACHE_ROOT / "boston_cache_train_val_list.json",
+    _DEFAULT_CACHE_TRAIN_VAL_LIST_PATH,
 )
 DEFAULT_CACHE_TRAIN_VAL_MANIFEST_PATH = _env_path(
     "NUPLAN_CACHE_TRAIN_VAL_MANIFEST_PATH",
-    DEFAULT_CACHE_ROOT / "boston_cache_train_val_manifest.json",
+    _DEFAULT_CACHE_TRAIN_VAL_MANIFEST_PATH,
 )
 DEFAULT_PLANNER_CACHE_DIR = os.environ.get(
     "NUPLAN_PLANNER_CACHE_DIR",
@@ -126,4 +179,3 @@ DEFAULT_PLANNER_CACHE_LIST_PATH = os.environ.get(
     str(DEFAULT_CACHE_TRAIN_VAL_LIST_PATH),
 ).strip()
 DEFAULT_NUM_WORKERS = max(1, _env_int("NUPLAN_DEFAULT_NUM_WORKERS", 54))
-

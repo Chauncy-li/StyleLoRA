@@ -21,3 +21,4 @@ tmp/
 RESEARCH.md
 requirements.before.txt
 run_nuboard.ipynb
+stylelora/config/paths.local.json
