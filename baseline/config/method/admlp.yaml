@@ -1,0 +1,13 @@
+# baseline/config/method/admlp.yaml
+#
+# AD-MLP 方法级结构参考。
+# 实际结构由 baseline/model/admlp/model.py 的 EgoStatusMLP 构造参数决定，
+# train（comparison/train_admlp.py）与 planner（EgoStatusPlanner）保持一致。
+
+name: "admlp"
+
+model:
+  input_dim: 8
+  hidden_dim: 512
+  num_poses: 8
+  time_horizon: 4.0

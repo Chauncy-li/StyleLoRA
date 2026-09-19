@@ -1,0 +1,21 @@
+# baseline/config/planner/stage_vector_planner.yaml
+#
+# STAGE-向量消融版 planner 的闭环仿真配置。
+# 运行时通过命令行覆盖 ckpt_path / stats_path / device。
+
+stage_vector_planner:
+  _target_: baseline.simulation.planner.StageVectorPlanner
+  _convert_: "all"
+
+  ckpt_path: ???
+  future_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+
+    num_poses: 8
+    time_horizon: 4.0
+
+  stats_path: ???
+  device: cuda
+  style_control: 0.0
+  style: null

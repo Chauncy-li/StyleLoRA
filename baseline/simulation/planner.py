@@ -14,6 +14,7 @@ NuPlan 仿真 planner 封装（注册制）。
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Deque, Dict, List, Optional, Type
 
@@ -22,6 +23,8 @@ import numpy as np
 import torch
 
 from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 from nuplan.planning.simulation.planner.abstract_planner import (
@@ -39,6 +42,9 @@ from baseline.core.register import Registry
 from baseline.model.diff_planner.diffusion_planner import Diffusion_Planner as BaseDiffusionPlannerModel
 from baseline.model.style_planner.diffusion_planner import Diffusion_Planner as StyleDiffusionPlannerModel
 from baseline.model.wayformer.wayf_planner import WayFormer
+from baseline.data_process import featurizers
+from baseline.model.admlp.model import STYLE_DIM, EgoStatusMLP
+from baseline.model.stage_vec.model import build_vec_model
 from baseline.simulation.anchor_generator import MapAnchorGenerator
 from baseline.simulation.candidate_selector import SafetyCandidateSelector
 from baseline.simulation.runtime_trace import (
@@ -1094,6 +1100,183 @@ class AnchorWarmStartStylePlanner(StylePlanner):
         return trajectory
 
 
+class EgoStatusPlanner(AbstractPlanner):
+    """AD-MLP（仅自车状态）planner 的 NuPlan 闭环仿真封装。
+
+    输入：自车速度(2) + 加速度(2) + 导航指令(4 one-hot) = 8 维。
+    输出：未来 num_poses 个相对位姿 (x, y, heading)。
+    特征口径与训练抽取（featurizers.build_admlp_input）完全一致。
+    """
+
+    planner_name = "ego_status_planner"
+
+    # 与 StyleDrive STYLE_MAP = {"A": 0, "N": 1, "C": 2} 对齐（激进/正常/保守）。
+    _STYLE_IDX = {"aggressive": 0, "normal": 1, "conservative": 2}
+
+    def __init__(
+        self,
+        ckpt_path: str,
+        future_trajectory_sampling: TrajectorySampling,
+        hidden_layer_dim: int = 512,
+        device: str = "cpu",
+        with_style: bool = False,
+        style: str = "normal",
+    ):
+        assert device in ["cpu", "cuda"], f"device {device} not supported"
+        if device == "cuda":
+            assert torch.cuda.is_available(), "cuda is not available"
+
+        self._ckpt_path = ckpt_path
+        self._device = device
+        self._with_style = with_style
+        self._style = style
+        self._future_horizon = future_trajectory_sampling.time_horizon
+        self._num_poses = future_trajectory_sampling.num_poses
+        self._step_interval = self._future_horizon / self._num_poses
+
+        self._mlp = EgoStatusMLP(hidden_dim=hidden_layer_dim, num_poses=self._num_poses, with_style=with_style)
+        self._load_checkpoint()
+
+        self._map_api = None
+
+    def _load_checkpoint(self) -> None:
+        ckpt = torch.load(self._ckpt_path, map_location=self._device, weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        if isinstance(ckpt, dict) and "with_style" in ckpt and bool(ckpt["with_style"]) != self._with_style:
+            raise ValueError(
+                f"checkpoint with_style={bool(ckpt['with_style'])} 与 planner with_style={self._with_style} 不一致"
+            )
+        self._mlp.load_state_dict(state_dict)
+        self._mlp.eval()
+        self._mlp = self._mlp.to(self._device)
+
+    def name(self) -> str:
+        return self.planner_name
+
+    def observation_type(self) -> Type[Observation]:
+        return DetectionsTracks
+
+    def initialize(self, initialization: PlannerInitialization) -> None:
+        self._map_api = initialization.map_api
+
+    def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
+        ego_state = current_input.history.ego_states[-1]
+
+        feature = featurizers.build_admlp_input(ego_state, self._map_api)
+        if self._with_style:
+            # 强制一个风格（对比可控性，非复现场景自身风格）——与训练侧 one-hot 口径一致。
+            style_feature = np.zeros(STYLE_DIM, dtype=np.float32)
+            style_feature[self._STYLE_IDX[self._style]] = 1.0
+            feature = np.concatenate([feature, style_feature]).astype(np.float32)
+        x = torch.from_numpy(feature).unsqueeze(0).to(self._device)
+
+        with torch.no_grad():
+            poses = self._mlp(x)[0].cpu().numpy().astype(np.float64)  # [num_poses, 3]
+
+        states = transform_predictions_to_states(
+            poses, current_input.history.ego_states, self._future_horizon, self._step_interval
+        )
+        return InterpolatedTrajectory(trajectory=states)
+
+
+class StageVectorPlanner(AbstractPlanner):
+    """STAGE-向量消融版（ACT/CVAE-DETR 去掉图像与 ray-cast，仅 256 维向量输入）的闭环封装。
+
+    注意：这不是 STAGE，是「STAGE-向量消融版」，其分数只能作为 STAGE 能力的下界。
+    输入：256 维向量（ego_state6 + lane_detector40 + navi_info10 + history_info200）。
+    输出：未来 num_poses 个局部路点 (x, y)，航向由相邻路点方向推导。
+    """
+
+    planner_name = "stage_vector_planner"
+
+    def __init__(
+        self,
+        ckpt_path: str,
+        future_trajectory_sampling: TrajectorySampling,
+        stats_path: str,
+        device: str = "cpu",
+        style_control: float = 0.0,
+        style: Optional[str] = None,
+    ):
+        assert device in ["cpu", "cuda"], f"device {device} not supported"
+        if device == "cuda":
+            assert torch.cuda.is_available(), "cuda is not available"
+
+        self._device = device
+        self._style = style
+        self._style_control = float(style_control)
+        self._future_horizon = future_trajectory_sampling.time_horizon
+        self._num_poses = future_trajectory_sampling.num_poses
+        self._step_interval = self._future_horizon / self._num_poses
+
+        self._model = build_vec_model(num_queries=self._num_poses)
+
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        self._model.load_state_dict(state_dict)
+        self._model.eval()
+        self._model = self._model.to(device)
+
+        stats = np.load(stats_path)
+        self._vec_mean = stats["vec_mean"].astype(np.float32)
+        self._vec_std = stats["vec_std"].astype(np.float32)
+        self._traj_mean = stats["traj_mean"].astype(np.float32)
+        self._traj_std = stats["traj_std"].astype(np.float32)
+
+        if self._style is not None:
+            sign = {"aggressive": 1.0, "normal": 0.0, "conservative": -1.0}[self._style]
+            if "style_value_std" not in stats:
+                raise ValueError(
+                    "stats_path 缺少 style_value_std，需用新版 train_stage_vec.py（保存 ±1σ 统计）重新训练"
+                )
+            self._style_control = sign * float(stats["style_value_std"])
+
+        self._map_api = None
+
+    def name(self) -> str:
+        return self.planner_name
+
+    def observation_type(self) -> Type[Observation]:
+        return DetectionsTracks
+
+    def initialize(self, initialization: PlannerInitialization) -> None:
+        self._map_api = initialization.map_api
+
+    def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
+        history = current_input.history
+        ego = history.ego_states[-1]
+
+        # yaw_rate 由历史航向变化反推（DB 不存 angular_velocity，与抽取器口径一致）
+        yaw_rate = 0.0
+        if len(history.ego_states) >= 2:
+            prev = history.ego_states[-2]
+            dt = float(ego.time_point.time_s - prev.time_point.time_s)
+            if dt > 0:
+                yaw_rate = featurizers.derive_yaw_rate(ego, prev, dt)
+
+        agents = history.observations[-1].tracked_objects.get_agents()
+        vec = featurizers.build_vector(ego, agents, self._map_api, yaw_rate=yaw_rate)
+        vec_n = (vec - self._vec_mean) / self._vec_std
+        x = torch.from_numpy(vec_n).unsqueeze(0).to(self._device)
+
+        with torch.no_grad():
+            a_hat, _, _, _ = self._model(x, style_control=torch.tensor([self._style_control]))
+
+        traj_n = a_hat["traj_action"][0].detach().cpu().numpy().astype(np.float64)  # [nq, 2] 归一化
+        traj = traj_n * self._traj_std + self._traj_mean  # 反归一化 -> 米（ego 局部系）
+
+        heading = np.zeros(self._num_poses, dtype=np.float64)
+        for i in range(self._num_poses - 1):
+            heading[i] = math.atan2(traj[i + 1, 1] - traj[i, 1], traj[i + 1, 0] - traj[i, 0])
+        heading[-1] = heading[-2] if self._num_poses >= 2 else 0.0
+        poses_xyh = np.concatenate([traj, heading[:, None]], axis=-1)
+
+        states = transform_predictions_to_states(
+            poses_xyh, history.ego_states, self._future_horizon, self._step_interval
+        )
+        return InterpolatedTrajectory(trajectory=states)
+
+
 def register_simulation_planners() -> None:
     """注册可用于 NuPlan 仿真的 planner。"""
     if len(SIMULATION_PLANNER_REGISTRY) > 0:
@@ -1104,6 +1287,8 @@ def register_simulation_planners() -> None:
         "anchor_warm_start_style_planner", AnchorWarmStartStylePlanner
     )
     SIMULATION_PLANNER_REGISTRY.register("wayformer", Wayformer)
+    SIMULATION_PLANNER_REGISTRY.register("ego_status_planner", EgoStatusPlanner)
+    SIMULATION_PLANNER_REGISTRY.register("stage_vector_planner", StageVectorPlanner)
 
 
 def get_registered_simulation_planners() -> List[str]:

@@ -45,6 +45,8 @@ SUPPORTED_PLANNERS_FALLBACK = [
     "style_planner",
     "anchor_warm_start_style_planner",
     "wayformer",
+    "ego_status_planner",
+    "stage_vector_planner",
 ]
 
 # 在线日志后端（默认 swanlab）
@@ -59,6 +61,9 @@ ONLINE_LOGGER = "swanlab"
 CHECKPOINT_DIR = "/mnt/mydata/lishangwen/NuplanBaselinesRecord/nuplan_baseline/train_log/diffusion-planner/2026_02_02-13_05_43"
 ARGS_FILE = os.path.join(CHECKPOINT_DIR, "args.json")
 CKPT_FILE = os.path.join(CHECKPOINT_DIR, "best_model-epoch_60-train_loss_0.0947.pth")
+
+# stage_vector_planner 用：归一化统计 npz（vec/traj/steer 的 mean/std）
+STATS_FILE = ""
 
 # ==============================================================================
 # style_planner runtime preference command（仅在 PLANNER="style_planner" 时生效）
@@ -77,6 +82,27 @@ CHALLENGE = "closed_loop_nonreactive_agents"
 BRANCH_NAME = "diffusion_debug"
 SCENARIO_BUILDER = "nuplan"
 MINI_TEST_LOG_JSON = REPO_ROOT / "baseline" / "resources" / "mini" / "splits" / "mini_test_logs.json"
+
+# ==============================================================================
+# 对比实验覆盖（comparison/run_closed_loop.sh 通过环境变量注入）
+# ==============================================================================
+PLANNER = os.environ.get("COMPARISON_PLANNER", PLANNER)
+CKPT_FILE = os.environ.get("COMPARISON_CKPT", CKPT_FILE)
+STATS_FILE = os.environ.get("COMPARISON_STATS", STATS_FILE)
+ARGS_FILE = os.environ.get("COMPARISON_ARGS_FILE", ARGS_FILE)
+SPLIT = os.environ.get("COMPARISON_SPLIT", SPLIT)
+NUPLAN_DATA_ROOT = os.environ.get("NUPLAN_DATA_ROOT", NUPLAN_DATA_ROOT)
+NUPLAN_MAPS_ROOT = os.environ.get("NUPLAN_MAPS_ROOT", NUPLAN_MAPS_ROOT)
+# comparison/run_closed_loop.sh 注入：闭环场景 token 名单 JSON 文件路径（学长的 tokens_file 口径）
+COMPARISON_TOKENS_FILE = os.environ.get("COMPARISON_TOKENS_FILE", "")
+
+# 6 组对比的风格覆盖：
+#   - AD-MLP：COMPARISON_EGO_WITH_STYLE=true 时拼接 3 维 one-hot，风格取 COMPARISON_EGO_STYLE。
+#   - StageVec：COMPARISON_STAGE_STYLE 非空时用 ±σ 映射，否则用 COMPARISON_STAGE_STYLE_CONTROL 原始值。
+COMPARISON_EGO_WITH_STYLE = os.environ.get("COMPARISON_EGO_WITH_STYLE", "false")
+COMPARISON_EGO_STYLE = os.environ.get("COMPARISON_EGO_STYLE", "normal")
+COMPARISON_STAGE_STYLE = os.environ.get("COMPARISON_STAGE_STYLE", "")
+COMPARISON_STAGE_STYLE_CONTROL = os.environ.get("COMPARISON_STAGE_STYLE_CONTROL", "0.0")
 
 
 def _resolve_local_config_path() -> Path:
@@ -110,6 +136,25 @@ def _load_log_name_list(path: Path) -> List[str]:
     try:
         with open(path, "r", encoding="utf-8") as file_obj:
             payload = json.load(file_obj)
+        if not isinstance(payload, list):
+            return []
+        return [str(item) for item in payload]
+    except Exception:
+        return []
+
+
+def _load_token_list(path: Path) -> List[str]:
+    """读取闭环场景 token 名单（学长 select_closed_loop_scenarios 的口径）。
+
+    支持纯列表，或 {"tokens": [...]} / {"scenario_tokens": [...]}。
+    """
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as file_obj:
+            payload = json.load(file_obj)
+        if isinstance(payload, dict):
+            payload = payload.get("tokens", payload.get("scenario_tokens"))
         if not isinstance(payload, list):
             return []
         return [str(item) for item in payload]
@@ -156,13 +201,28 @@ def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str, int]:
         f"file://{local_config_path}]"
     )
 
-    planner_overrides = [
-        _planner_override(PLANNER, "config.args_file", ARGS_FILE),
-        _planner_override(PLANNER, "ckpt_path", CKPT_FILE),
-        _planner_override(PLANNER, "device", "cuda"),
-        _planner_override(PLANNER, "config.render_save_dir", video_output_dir),
-        _planner_override(PLANNER, "config.raw_data_save_dir", raw_output_dir),
-    ]
+    if PLANNER in ("ego_status_planner", "stage_vector_planner"):
+        planner_overrides = [
+            _planner_override(PLANNER, "ckpt_path", CKPT_FILE),
+            _planner_override(PLANNER, "device", "cuda"),
+        ]
+        if PLANNER == "ego_status_planner":
+            planner_overrides.append(_planner_override(PLANNER, "with_style", COMPARISON_EGO_WITH_STYLE))
+            planner_overrides.append(_planner_override(PLANNER, "style", COMPARISON_EGO_STYLE))
+        if PLANNER == "stage_vector_planner":
+            planner_overrides.append(_planner_override(PLANNER, "stats_path", STATS_FILE))
+            if COMPARISON_STAGE_STYLE:
+                planner_overrides.append(_planner_override(PLANNER, "style", COMPARISON_STAGE_STYLE))
+            else:
+                planner_overrides.append(_planner_override(PLANNER, "style_control", COMPARISON_STAGE_STYLE_CONTROL))
+    else:
+        planner_overrides = [
+            _planner_override(PLANNER, "config.args_file", ARGS_FILE),
+            _planner_override(PLANNER, "ckpt_path", CKPT_FILE),
+            _planner_override(PLANNER, "device", "cuda"),
+            _planner_override(PLANNER, "config.render_save_dir", video_output_dir),
+            _planner_override(PLANNER, "config.raw_data_save_dir", raw_output_dir),
+        ]
     if PLANNER == "style_planner":
         planner_overrides.extend(
             [
@@ -190,6 +250,18 @@ def _build_sys_argv(timestamp: str) -> Tuple[List[str], str, str, str, int]:
             )
     scenario_filter_overrides: List[str] = []
     mini_test_count = 0
+    if COMPARISON_TOKENS_FILE:
+        comparison_tokens = _load_token_list(Path(COMPARISON_TOKENS_FILE))
+        if comparison_tokens:
+            # 与学长 evaluate_closed_loop.py 一致：scenario_tokens + limit_total_scenarios。
+            compact = json.dumps(comparison_tokens, ensure_ascii=False, separators=(",", ":"))
+            scenario_filter_overrides.extend(
+                [
+                    f"scenario_filter.scenario_tokens={compact}",
+                    f"scenario_filter.limit_total_scenarios={len(comparison_tokens)}",
+                ]
+            )
+            mini_test_count = len(comparison_tokens)
     if SPLIT == "mini":
         mini_test_logs = _load_log_name_list(MINI_TEST_LOG_JSON)
         if mini_test_logs:
@@ -292,6 +364,11 @@ def main() -> None:
     if not os.path.exists(CKPT_FILE):
         print(f"\n❌ [Error] 找不到模型文件: {CKPT_FILE}")
         print("请先修改脚本顶部 CHECKPOINT_DIR / CKPT_FILE。")
+        raise SystemExit(1)
+
+    if PLANNER == "stage_vector_planner" and (not STATS_FILE or not os.path.exists(STATS_FILE)):
+        print(f"\n❌ [Error] stage_vector_planner 需要归一化统计 stats_path: {STATS_FILE}")
+        print("请通过 COMPARISON_STATS 指定 stage_vec_stats.npz 路径。")
         raise SystemExit(1)
 
     from nuplan.planning.script.run_simulation import main as nuplan_main

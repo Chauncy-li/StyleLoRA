@@ -8,6 +8,7 @@ __pycache__/
 ckpt/
 image*
 !nuplan-devkit/nuplan/database/utils/image.py
+!nuplan-devkit/nuplan/database/nuplan_db/image.py
 exp/
 cache/
 checkpoints/

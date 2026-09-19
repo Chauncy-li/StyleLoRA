@@ -1,0 +1,21 @@
+# baseline/config/planner/ego_status_planner.yaml
+#
+# AD-MLP（仅自车状态）planner 的闭环仿真配置。
+# 运行时通过命令行覆盖 ckpt_path / device。
+
+ego_status_planner:
+  _target_: baseline.simulation.planner.EgoStatusPlanner
+  _convert_: "all"
+
+  ckpt_path: ???
+  future_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+
+    num_poses: 8
+    time_horizon: 4.0
+
+  hidden_layer_dim: 512
+  device: cuda
+  with_style: false
+  style: normal

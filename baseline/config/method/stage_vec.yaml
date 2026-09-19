@@ -1,0 +1,17 @@
+# baseline/config/method/stage_vec.yaml
+#
+# StageVec（STAGE-向量消融版）方法级结构参考。
+# 实际结构由 baseline/model/stage_vec/model.py 的 build_vec_model 决定，
+# train（comparison/train_stage_vec.py）与 planner（StageVectorPlanner）保持一致。
+
+name: "stage-vec"
+
+model:
+  hidden_dim: 256
+  dim_feedforward: 1024
+  nheads: 8
+  enc_layers: 4
+  dec_layers: 1
+  num_queries: 8
+  latent_dim: 32
+  input_state_dim: 256
